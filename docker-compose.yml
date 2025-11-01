@@ -1,0 +1,72 @@
+services:
+  # Node.js Application
+  app:
+    build: .
+    container_name: twocents-app
+    restart: always
+    ports:
+      - "${HOST_APP_PORT}:${PORT}"
+    environment:
+      - NODE_ENV=${NODE_ENV}
+      - PORT=${PORT}
+      - MYSQL_HOST=${MYSQL_HOST}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - twocents-network
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: twocents-mysql
+    restart: always
+    ports:
+      - "${HOST_MYSQL_PORT}:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - twocents-network
+
+  # Redis Cache
+  redis:
+    image: redis:alpine
+    container_name: twocents-redis
+    restart: always
+    ports:
+      - "${HOST_REDIS_PORT}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - twocents-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: twocents-nginx
+    restart: always
+    ports:
+      - "${HOST_NGINX_PORT}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - twocents-network
+
+volumes:
+  mysql-data:
+  redis-data:
+
+networks:
+  twocents-network:
+    driver: bridge
+
