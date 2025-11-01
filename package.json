@@ -8,12 +8,21 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "nodemon server.js",
+    "test": "jest",
+    "migrate": "node cli/migrate.js all",
+    "migrate:status": "node cli/migrate.js status",
+    "migrate:up": "node cli/migrate.js up",
+    "migrate:down": "node cli/migrate.js down",
+    "migrate:create": "node cli/migrate.js create"
   },
   "dependencies": {
     "express": "^5.1.0",
     "mysql2": "^3.6.5",
-    "redis": "^4.6.10",
-    "nodemon": "^3.1.10"
+    "nodemon": "^3.1.10",
+    "redis": "^4.6.10"
+  },
+  "devDependencies": {
+    "jest": "^30.2.0"
   }
 }
