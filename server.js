@@ -1,54 +1,40 @@
 const express = require('express');
-const mysql = require('mysql2/promise');
-const redis = require('redis');
+const { DBForge } = require('./db');
+const { createRedisService } = require('./redis');
 
 const app = express();
 app.use(express.json());
 
-// MySQL Connection Pool
-const pool = mysql.createPool({
-    host: process.env.MYSQL_HOST || 'localhost',
-    user: process.env.MYSQL_USER || 'root',
-    password: process.env.MYSQL_PASSWORD || 'rootpassword',
-    database: process.env.MYSQL_DATABASE || 'twocents_db',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
+// MySQL Connection Pool - using DBForge
+const pool = DBForge.createPoolFromEnv();
 
-// Redis Client
-const redisClient = redis.createClient({
-    socket: {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: process.env.REDIS_PORT || 6379
-    }
-});
-
-redisClient.on('error', (err) => console.log('Redis Client Error', err));
-redisClient.on('connect', () => console.log('Connected to Redis'));
-
-// Connect to Redis
-redisClient.connect();
+// Redis Service - will be initialized on server start
+let redisService = null;
 
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'OK', message: 'Server is healthy' });
 });
 
-// Root endpoint
+// Root endpoint - Test Redis + MySQL connection
 app.get('/', async (req, res) => {
     try {
         // Test Redis
-        await redisClient.set('test_key', 'Hello from Redis!');
-        const redisValue = await redisClient.get('test_key');
+        const testKey = 'test_key';
+        await redisService.redis.set(testKey, 'Hello from Redis!');
+        const redisValue = await redisService.redis.get(testKey);
         
         // Test MySQL
         const [rows] = await pool.query('SELECT 1 + 1 AS result');
+        
+        // Test Redis health
+        const redisHealth = await redisService.healthCheck();
         
         res.json({
             message: "Get request received",
             redis: redisValue,
             mysql: rows[0].result,
+            redis_healthy: redisHealth.healthy,
             status: "All services connected successfully"
         });
     } catch (error) {
@@ -99,7 +85,7 @@ app.post('/users', async (req, res) => {
 app.get('/users', async (req, res) => {
     try {
         // Try to get from cache first
-        const cached = await redisClient.get('users_list');
+        const cached = await redisService.redis.get('users_list');
         if (cached) {
             return res.json({ 
                 source: 'cache', 
@@ -111,7 +97,7 @@ app.get('/users', async (req, res) => {
         const [rows] = await pool.query('SELECT * FROM users');
         
         // Store in cache for 60 seconds
-        await redisClient.setEx('users_list', 60, JSON.stringify(rows));
+        await redisService.redis.setEx('users_list', 60, JSON.stringify(rows));
         
         res.json({ 
             source: 'database', 
@@ -123,10 +109,52 @@ app.get('/users', async (req, res) => {
     }
 });
 
-const port = process.env.PORT || 3000;
+// Server startup with Redis initialization
+async function startServer() {
+    try {
+        // Initialize Redis
+        console.log('Initializing Redis...');
+        redisService = await createRedisService();
+        console.log('✓ Redis connected and ready');
+        
+        // Store in app.locals for use in routes
+        app.locals.redisService = redisService;
+        app.locals.pool = pool;
+        
+        // Start server
+        const port = process.env.PORT || 3000;
+        app.listen(port, () => {
+            console.log(`✓ Server is running on port ${port}`);
+            console.log(`✓ MySQL Host: ${process.env.MYSQL_HOST || 'localhost'}`);
+            console.log(`✓ Redis Host: ${process.env.REDIS_HOST || 'localhost'}`);
+            console.log(`✓ All services initialized successfully!`);
+        });
+    } catch (error) {
+        console.error('✗ Failed to start server:', error);
+        process.exit(1);
+    }
+}
 
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-    console.log(`MySQL Host: ${process.env.MYSQL_HOST || 'localhost'}`);
-    console.log(`Redis Host: ${process.env.REDIS_HOST || 'localhost'}`);
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, closing gracefully...');
+    const { closeRedisClient } = require('./redis/client');
+    if (redisService && redisService.redis) {
+        await closeRedisClient(redisService.redis);
+    }
+    await pool.end();
+    process.exit(0);
 });
+
+process.on('SIGINT', async () => {
+    console.log('SIGINT received, closing gracefully...');
+    const { closeRedisClient } = require('./redis/client');
+    if (redisService && redisService.redis) {
+        await closeRedisClient(redisService.redis);
+    }
+    await pool.end();
+    process.exit(0);
+});
+
+// Start the server
+startServer();
