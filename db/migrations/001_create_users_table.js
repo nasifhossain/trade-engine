@@ -77,7 +77,7 @@ async function up(pool) {
   forge.add_key('email');
   
   // Add index on status for filtering
-  forge.add_key('status');
+  // forge.add_key('status');
   
   // Create table with InnoDB engine
   await forge.create_table('users', true, { engine: 'InnoDB' });
