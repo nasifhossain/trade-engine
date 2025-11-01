@@ -443,8 +443,13 @@ class TableManager {
   }
 }
 
+// Import query builder functionality
+const { QueryBuilder, DB } = require('./query');
+
 module.exports = {
   DBForge,
   TableManager,
+  QueryBuilder,
+  DB,
   createPoolFromEnv: DBForge.createPoolFromEnv
 };
