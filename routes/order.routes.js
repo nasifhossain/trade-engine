@@ -3,6 +3,211 @@ const OrderServices = require('../services/order.services');
 
 const router = express.Router();
 
+// Initialize order services once and reuse (will be moved to app.js)
+let orderServicesInstance = null;
+
+/**
+ * Initialize order services helper
+ */
+async function getOrderServices(req) {
+    if (!orderServicesInstance) {
+        const pool = req.app.locals.pool;
+        const redisService = req.app.locals.redisService;
+
+        if (!pool || !redisService) {
+            throw new Error('Database or Redis service not available');
+        }
+
+        orderServicesInstance = new OrderServices(pool, redisService);
+        await orderServicesInstance.initialize();
+    }
+    return orderServicesInstance;
+}
+
+/**
+ * POST /orders
+ * Create a new order (unified endpoint as per assignment requirements)
+ * This is where the matching algorithm runs!
+ * 
+ * Expected request body:
+ * {
+ *   "idempotency_key": "string (optional)",
+ *   "order_id": "string (optional, server generates if not provided)",
+ *   "client_id": "string",
+ *   "instrument": "string (e.g., BTC-USD)",
+ *   "side": "buy | sell",
+ *   "type": "limit | market",
+ *   "price": "number (required for limit orders)",
+ *   "quantity": "number"
+ * }
+ */
+router.post('/orders', async (req, res) => {
+    try {
+        // Get idempotency key from header or body
+        const idempotencyKey = req.headers['idempotency-key'] || req.body.idempotency_key;
+
+        // Initialize order services
+        const orderServices = await getOrderServices(req);
+
+        // Validate request body
+        if (!req.body || Object.keys(req.body).length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Request body is required'
+            });
+        }
+
+        // Create order (this triggers the matching engine!)
+        const result = await orderServices.createOrder(req.body, idempotencyKey);
+
+        // Return success response
+        res.status(201).json(result);
+
+    } catch (error) {
+        console.error('Error in /orders endpoint:', error);
+        
+        // Handle validation errors vs server errors
+        const statusCode = error.message.includes('Missing required fields') ||
+                          error.message.includes('must be') ||
+                          error.message.includes('Invalid') ? 400 : 500;
+
+        res.status(statusCode).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * POST /orders/{order_id}/cancel
+ * Cancel an existing order
+ */
+router.post('/orders/:order_id/cancel', async (req, res) => {
+    try {
+        const { order_id } = req.params;
+        
+        if (!order_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Order ID is required'
+            });
+        }
+
+        const orderServices = await getOrderServices(req);
+        const result = await orderServices.cancelOrder(order_id);
+
+        res.status(200).json(result);
+
+    } catch (error) {
+        console.error('Error in /orders/:order_id/cancel endpoint:', error);
+        
+        const statusCode = error.message.includes('not found') ? 404 : 500;
+        
+        res.status(statusCode).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /orders/{order_id}
+ * Get order status by ID
+ */
+router.get('/orders/:order_id', async (req, res) => {
+    try {
+        const { order_id } = req.params;
+        
+        if (!order_id) {
+            return res.status(400).json({
+                success: false,
+                error: 'Order ID is required'
+            });
+        }
+
+        const orderServices = await getOrderServices(req);
+        const result = await orderServices.getOrderById(order_id);
+
+        res.status(200).json(result);
+
+    } catch (error) {
+        console.error('Error in /orders/:order_id endpoint:', error);
+        
+        const statusCode = error.message.includes('not found') ? 404 : 500;
+        
+        res.status(statusCode).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /orderbook
+ * Get current order book state
+ * 
+ * Query parameters:
+ * - instrument: Trading instrument (default: BTC-USD)
+ * - levels: Number of price levels (default: 20)
+ */
+router.get('/orderbook', async (req, res) => {
+    try {
+        const { 
+            instrument = 'BTC-USD', 
+            levels = 20 
+        } = req.query;
+
+        const orderServices = await getOrderServices(req);
+        const result = await orderServices.getOrderBook(instrument, parseInt(levels));
+
+        res.status(200).json(result);
+
+    } catch (error) {
+        console.error('Error in /orderbook endpoint:', error);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /trades
+ * Get recent trades
+ * 
+ * Query parameters:
+ * - instrument: Filter by instrument
+ * - limit: Number of trades to return (default: 50)
+ * - offset: Pagination offset (default: 0)
+ */
+router.get('/trades', async (req, res) => {
+    try {
+        const {
+            instrument,
+            limit = 50,
+            offset = 0
+        } = req.query;
+
+        const orderServices = await getOrderServices(req);
+        const result = await orderServices.getTrades({
+            instrument,
+            limit: parseInt(limit),
+            offset: parseInt(offset)
+        });
+
+        res.status(200).json(result);
+
+    } catch (error) {
+        console.error('Error in /trades endpoint:', error);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 /**
  * POST /sell
  * Create a sell order
