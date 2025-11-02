@@ -2,6 +2,9 @@ const express = require('express');
 const { DBForge } = require('./db');
 const { createRedisService } = require('./redis');
 
+// Import routes
+const orderRoutes = require('./routes/order.routes');
+
 const app = express();
 app.use(express.json());
 
@@ -108,6 +111,9 @@ app.get('/users', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
+// Use order routes
+app.use('/api/orders', orderRoutes);
 
 // Server startup with Redis initialization
 async function startServer() {
