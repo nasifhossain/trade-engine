@@ -41,17 +41,7 @@ class OrderServices {
      */
     async createOrder(orderData, idempotencyKey = null) {
         try {
-            const {
-                order_id,
-                client_id,
-                instrument,
-                side,
-                type,
-                price,
-                quantity,
-                filled_quantity = 0,
-                status = 'open'
-            } = orderData;
+            const { side } = orderData;
 
             // Check idempotency if key provided
             if (idempotencyKey) {
@@ -62,8 +52,8 @@ class OrderServices {
                 }
             }
 
-            // Validate required fields
-            if (!client_id || !instrument || !side || !type || !quantity) {
+            // Validate required fields (basic validation)
+            if (!orderData.client_id || !orderData.instrument || !side || !orderData.type || !orderData.quantity) {
                 throw new Error('Missing required fields: client_id, instrument, side, type, quantity');
             }
 
@@ -72,95 +62,29 @@ class OrderServices {
                 throw new Error('Side must be either "buy" or "sell"');
             }
 
-            // Validate order type
-            if (!['limit', 'market'].includes(type)) {
-                throw new Error('Order type must be either "limit" or "market"');
+            let result;
+
+            // Route to appropriate method based on side - these have full matching engine integration!
+            if (side === 'sell') {
+                console.log('🔄 Routing to createSellOrder with matching engine...');
+                result = await this.createSellOrder(orderData);
+            } else if (side === 'buy') {
+                console.log('🔄 Routing to createBuyOrder with matching engine...');
+                result = await this.createBuyOrder(orderData);
             }
-
-            // Validate and parse quantity
-            const parsedQuantity = parseFloat(quantity);
-            if (isNaN(parsedQuantity) || parsedQuantity <= 0) {
-                throw new Error('Quantity must be a valid number greater than 0');
-            }
-
-            // Validate and parse price for limit orders
-            let parsedPrice = null;
-            if (type === 'limit') {
-                parsedPrice = parseFloat(price);
-                if (isNaN(parsedPrice) || parsedPrice <= 0) {
-                    throw new Error('Price must be a valid number greater than 0 for limit orders');
-                }
-            }
-
-            // Parse filled_quantity and ensure it's a valid decimal
-            const parsedFilledQuantity = parseFloat(filled_quantity) || 0;
-            if (isNaN(parsedFilledQuantity) || parsedFilledQuantity < 0) {
-                throw new Error('Filled quantity must be a valid number >= 0');
-            }
-
-            // Generate server-side UUID for order_id if not provided
-            const finalOrderId = order_id || randomUUID();
-
-            // Prepare order data for insertion with properly parsed numbers
-            const orderToInsert = {
-                order_id: finalOrderId,
-                client_id,
-                instrument,
-                side,
-                type,
-                price: parsedPrice ? parseFloat(parsedPrice.toFixed(8)) : null,
-                quantity: parseFloat(parsedQuantity.toFixed(8)),
-                filled_quantity: parseFloat(parsedFilledQuantity.toFixed(8)),
-                status
-            };
-
-            // Insert order into database first
-            const insertResult = await DB.insert('orders', orderToInsert);
-            if (!insertResult.success) {
-                throw new Error('Failed to insert order into database');
-            }
-
-            // Fetch the created order with timestamps
-            const createdOrder = await DB.find_one('orders', { order_id: finalOrderId });
-
-            // *** THIS IS WHERE THE MATCHING ALGORITHM RUNS! ***
-            const matchResult = await this.matchingEngine.processOrder(createdOrder);
-
-            // Prepare response
-            const response = {
-                success: true,
-                message: `${side.charAt(0).toUpperCase() + side.slice(1)} order created successfully`,
-                order: await DB.find_one('orders', { order_id: finalOrderId }), // Get updated order
-                match_result: {
-                    trades_executed: matchResult.trades.length,
-                    trades: matchResult.trades,
-                    orders_affected: matchResult.orderUpdates.length,
-                    book_changes: matchResult.bookUpdates.length
-                }
-            };
-
-            // Cache the order in Redis
-            const cacheKey = `order:${finalOrderId}`;
-            await this.redisService.redis.setEx(
-                cacheKey, 
-                300, // 5 minutes TTL
-                JSON.stringify(response.order)
-            );
 
             // Cache idempotency result if key provided
-            if (idempotencyKey) {
+            if (idempotencyKey && result) {
                 const idempotencyCacheKey = `idempotency:${idempotencyKey}`;
                 await this.redisService.redis.setEx(
                     idempotencyCacheKey,
                     3600, // 1 hour TTL
-                    JSON.stringify(response)
+                    JSON.stringify(result)
                 );
+                console.log(`✅ Idempotency key cached: ${idempotencyKey}`);
             }
 
-            // Log the matching result
-            console.log(`Order ${finalOrderId} processed: ${matchResult.trades.length} trades executed`);
-
-            return response;
+            return result;
 
         } catch (error) {
             console.error('Error creating order:', error);
@@ -419,10 +343,52 @@ class OrderServices {
                 );
             }
 
+            // *** RUN MATCHING ENGINE FOR SELL ORDERS! ***
+            const matchResult = await this.matchingEngine.processOrder(createdOrder);
+
+            // Get updated order after matching
+            const updatedOrder = await DB.find_one('orders', { order_id });
+
+            // Update Redis with final order state
+            await this.redisService.storeOrderDetails(order_id, updatedOrder);
+
+            // Add recent trades to Redis for fast access
+            for (const trade of matchResult.trades) {
+                await this.redisService.addRecentTrade(instrument, trade);
+            }
+
+            // Remove filled orders from Redis order book
+            for (const update of matchResult.orderUpdates) {
+                if (update.status === 'filled') {
+                    // Remove from order book since it's fully filled
+                    await this.redisService.removeOrderFromBook(
+                        instrument,
+                        update.side,
+                        update.order_id,
+                        new Date(update.created_at).getTime()
+                    );
+                } else if (update.status === 'partially_filled') {
+                    // Update order status in Redis
+                    await this.redisService.updateOrderStatus(
+                        update.order_id,
+                        update.status,
+                        update.filled_quantity
+                    );
+                }
+            }
+
+            console.log(`🚀 Sell Order ${order_id} processed: ${matchResult.trades.length} trades executed`);
+
             return {
                 success: true,
                 message: 'Sell order created successfully',
-                order: createdOrder
+                order: updatedOrder,
+                match_result: {
+                    trades_executed: matchResult.trades.length,
+                    trades: matchResult.trades,
+                    orders_affected: matchResult.orderUpdates.length,
+                    book_changes: matchResult.bookUpdates.length
+                }
             };
 
         } catch (error) {
@@ -631,10 +597,52 @@ class OrderServices {
                 );
             }
 
+            // *** RUN MATCHING ENGINE FOR BUY ORDERS! ***
+            const matchResult = await this.matchingEngine.processOrder(createdOrder);
+
+            // Get updated order after matching
+            const updatedOrder = await DB.find_one('orders', { order_id });
+
+            // Update Redis with final order state
+            await this.redisService.storeOrderDetails(order_id, updatedOrder);
+
+            // Add recent trades to Redis for fast access
+            for (const trade of matchResult.trades) {
+                await this.redisService.addRecentTrade(instrument, trade);
+            }
+
+            // Remove filled orders from Redis order book
+            for (const update of matchResult.orderUpdates) {
+                if (update.status === 'filled') {
+                    // Remove from order book since it's fully filled
+                    await this.redisService.removeOrderFromBook(
+                        instrument,
+                        update.side,
+                        update.order_id,
+                        new Date(update.created_at).getTime()
+                    );
+                } else if (update.status === 'partially_filled') {
+                    // Update order status in Redis
+                    await this.redisService.updateOrderStatus(
+                        update.order_id,
+                        update.status,
+                        update.filled_quantity
+                    );
+                }
+            }
+
+            console.log(`🚀 Buy Order ${order_id} processed: ${matchResult.trades.length} trades executed`);
+
             return {
                 success: true,
                 message: 'Buy order created successfully',
-                order: createdOrder
+                order: updatedOrder,
+                match_result: {
+                    trades_executed: matchResult.trades.length,
+                    trades: matchResult.trades,
+                    orders_affected: matchResult.orderUpdates.length,
+                    book_changes: matchResult.bookUpdates.length
+                }
             };
 
         } catch (error) {
