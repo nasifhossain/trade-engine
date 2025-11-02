@@ -120,6 +120,7 @@ class RedisService {
     const key = `order:${orderId}`;
     
     // Convert object to flat hash structure
+    // Redis HASH requires all values to be strings
     const hashData = {
       order_id: orderData.order_id,
       client_id: orderData.client_id,
@@ -130,8 +131,12 @@ class RedisService {
       quantity: orderData.quantity.toString(),
       filled_quantity: orderData.filled_quantity?.toString() || '0',
       status: orderData.status,
-      created_at: orderData.created_at,
-      updated_at: orderData.updated_at
+      created_at: orderData.created_at instanceof Date 
+        ? orderData.created_at.toISOString() 
+        : orderData.created_at?.toString() || new Date().toISOString(),
+      updated_at: orderData.updated_at instanceof Date 
+        ? orderData.updated_at.toISOString() 
+        : orderData.updated_at?.toString() || new Date().toISOString()
     };
 
     await this.redis.hSet(key, hashData);
