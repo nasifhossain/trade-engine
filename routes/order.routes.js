@@ -124,4 +124,189 @@ router.get('/sell', async (req, res) => {
     }
 });
 
+/**
+ * POST /buy
+ * Create a buy order
+ * 
+ * Expected request body:
+ * {
+ *   "client_id": "string",
+ *   "instrument": "string (e.g., BTC-USD)",
+ *   "type": "limit | market",
+ *   "price": "number (required for limit orders)",
+ *   "quantity": "number",
+ *   "filled_quantity": "number (optional, defaults to 0)",
+ *   "status": "open | partially_filled | filled | cancelled | rejected (optional, defaults to 'open')"
+ * }
+ * 
+ * Note: order_id is server-generated UUID, side is automatically set to 'buy'
+ * created_at and updated_at are automatically set by database
+ */
+router.post('/buy', async (req, res) => {
+    try {
+        // Get database pool and redis service from app locals
+        const pool = req.app.locals.pool;
+        const redisService = req.app.locals.redisService;
+
+        if (!pool || !redisService) {
+            return res.status(500).json({
+                success: false,
+                error: 'Database or Redis service not available'
+            });
+        }
+
+        // Initialize order services with pool and redis service
+        const orderServices = new OrderServices(pool, redisService);
+
+        // Validate request body
+        if (!req.body || Object.keys(req.body).length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Request body is required'
+            });
+        }
+
+        // Create buy order
+        const result = await orderServices.createBuyOrder(req.body);
+
+        // Return success response
+        res.status(201).json(result);
+
+    } catch (error) {
+        console.error('Error in /buy endpoint:', error);
+        
+        // Handle validation errors vs server errors
+        const statusCode = error.message.includes('Missing required fields') ||
+                          error.message.includes('must be') ||
+                          error.message.includes('Invalid') ? 400 : 500;
+
+        res.status(statusCode).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /buy
+ * Retrieve buy orders
+ * 
+ * Query parameters (optional):
+ * - client_id: Filter by client ID
+ * - instrument: Filter by instrument (e.g., BTC-USD)
+ * - status: Filter by status (open, partially_filled, filled, cancelled, rejected)
+ * - limit: Limit number of results (default: 100, max: 1000)
+ * - offset: Offset for pagination (default: 0)
+ */
+router.get('/buy', async (req, res) => {
+    try {
+        // Get database pool and redis service from app locals
+        const pool = req.app.locals.pool;
+        const redisService = req.app.locals.redisService;
+
+        if (!pool || !redisService) {
+            return res.status(500).json({
+                success: false,
+                error: 'Database or Redis service not available'
+            });
+        }
+
+        // Initialize order services with pool and redis service
+        const orderServices = new OrderServices(pool, redisService);
+
+        // Get query parameters
+        const {
+            client_id,
+            instrument,
+            status,
+            limit = 100,
+            offset = 0
+        } = req.query;
+
+        // Get buy orders
+        const result = await orderServices.getBuyOrders({
+            client_id,
+            instrument,
+            status,
+            limit: Math.min(parseInt(limit) || 100, 1000), // Max 1000 records
+            offset: parseInt(offset) || 0
+        });
+
+        // Return success response
+        res.status(200).json(result);
+
+    } catch (error) {
+        console.error('Error in GET /buy endpoint:', error);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * GET /all
+ * Retrieve all orders (both buy and sell)
+ * 
+ * Query parameters (optional):
+ * - client_id: Filter by client ID
+ * - instrument: Filter by instrument (e.g., BTC-USD)
+ * - side: Filter by side (buy, sell)
+ * - status: Filter by status (open, partially_filled, filled, cancelled, rejected)
+ * - type: Filter by type (limit, market)
+ * - limit: Limit number of results (default: 100, max: 1000)
+ * - offset: Offset for pagination (default: 0)
+ */
+router.get('/all', async (req, res) => {
+    try {
+        // Get database pool and redis service from app locals
+        const pool = req.app.locals.pool;
+        const redisService = req.app.locals.redisService;
+
+        if (!pool || !redisService) {
+            return res.status(500).json({
+                success: false,
+                error: 'Database or Redis service not available'
+            });
+        }
+
+        // Initialize order services with pool and redis service
+        const orderServices = new OrderServices(pool, redisService);
+
+        // Get query parameters
+        const {
+            client_id,
+            instrument,
+            side,
+            status,
+            type,
+            limit = 100,
+            offset = 0
+        } = req.query;
+
+        // Get all orders
+        const result = await orderServices.getAllOrders({
+            client_id,
+            instrument,
+            side,
+            status,
+            type,
+            limit: Math.min(parseInt(limit) || 100, 1000), // Max 1000 records
+            offset: parseInt(offset) || 0
+        });
+
+        // Return success response
+        res.status(200).json(result);
+
+    } catch (error) {
+        console.error('Error in GET /all endpoint:', error);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 module.exports = router;
