@@ -338,6 +338,274 @@ class RedisService {
     const info = await this.redis.info();
     return info;
   }
+
+  // ==================== PERSISTENCE QUEUE OPERATIONS ====================
+  
+  /**
+   * Queue an operation for async database persistence
+   * @param {string} type - Operation type ('order_create', 'trade', 'order_update')
+   * @param {object} data - Operation data
+   */
+  async queuePersistence(type, data) {
+    const key = 'persist:queue';
+    const item = JSON.stringify({ type, data, timestamp: Date.now() });
+    await this.redis.lPush(key, item);
+  }
+
+  /**
+   * Get next batch of items from persistence queue
+   * @param {number} batchSize - Number of items to retrieve
+   * @returns {Promise<Array>} Batch of items to persist
+   */
+  async getPersistenceBatch(batchSize = 100) {
+    const key = 'persist:queue';
+    const items = await this.redis.lRange(key, 0, batchSize - 1);
+    return items.map(item => JSON.parse(item));
+  }
+
+  /**
+   * Remove persisted items from queue
+   * @param {number} count - Number of items to remove
+   */
+  async removePersisted(count) {
+    const key = 'persist:queue';
+    await this.redis.lTrim(key, count, -1);
+  }
+
+  /**
+   * Get persistence queue size
+   * @returns {Promise<number>} Queue size
+   */
+  async getPersistenceQueueSize() {
+    const key = 'persist:queue';
+    return await this.redis.lLen(key);
+  }
+
+  // ==================== ORDER INDEXING OPERATIONS ====================
+  
+  /**
+   * Add order to client index
+   * @param {string} clientId - Client ID
+   * @param {string} orderId - Order ID
+   */
+  async indexOrderByClient(clientId, orderId) {
+    const key = `client:orders:${clientId}`;
+    await this.redis.sAdd(key, orderId);
+    await this.redis.expire(key, 86400);  // 24-hour TTL
+  }
+
+  /**
+   * Add order to instrument index
+   * @param {string} instrument - Instrument name
+   * @param {string} orderId - Order ID
+   */
+  async indexOrderByInstrument(instrument, orderId) {
+    const key = `instrument:orders:${instrument}`;
+    await this.redis.sAdd(key, orderId);
+    await this.redis.expire(key, 86400);
+  }
+
+  /**
+   * Add order to status index
+   * @param {string} status - Order status
+   * @param {string} orderId - Order ID
+   */
+  async indexOrderByStatus(status, orderId) {
+    const key = `order:status:${status}`;
+    await this.redis.sAdd(key, orderId);
+    await this.redis.expire(key, 86400);
+  }
+
+  /**
+   * Get all orders for a client
+   * @param {string} clientId - Client ID
+   * @returns {Promise<Array>} Set of order IDs
+   */
+  async getClientOrders(clientId) {
+    const key = `client:orders:${clientId}`;
+    return await this.redis.sMembers(key);
+  }
+
+  /**
+   * Get all orders for an instrument
+   * @param {string} instrument - Instrument name
+   * @returns {Promise<Array>} Set of order IDs
+   */
+  async getInstrumentOrders(instrument) {
+    const key = `instrument:orders:${instrument}`;
+    return await this.redis.sMembers(key);
+  }
+
+  /**
+   * Get all orders with a specific status
+   * @param {string} status - Order status
+   * @returns {Promise<Array>} Set of order IDs
+   */
+  async getOrdersByStatus(status) {
+    const key = `order:status:${status}`;
+    return await this.redis.sMembers(key);
+  }
+
+  /**
+   * Remove order from all indices
+   * @param {string} clientId - Client ID
+   * @param {string} instrument - Instrument name
+   * @param {string} oldStatus - Previous status
+   * @param {string} newStatus - New status
+   * @param {string} orderId - Order ID
+   */
+  async updateOrderIndices(clientId, instrument, oldStatus, newStatus, orderId) {
+    // Remove from old status index
+    if (oldStatus) {
+      const oldStatusKey = `order:status:${oldStatus}`;
+      await this.redis.sRem(oldStatusKey, orderId);
+    }
+    
+    // Add to new status index
+    if (newStatus) {
+      const newStatusKey = `order:status:${newStatus}`;
+      await this.redis.sAdd(newStatusKey, orderId);
+      await this.redis.expire(newStatusKey, 86400);
+    }
+  }
+
+  /**
+   * Create a snapshot of current order book state
+   * @param {string} instrument - Instrument name
+   * @param {object} bookData - Order book data
+   */
+  async createSnapshot(instrument, bookData) {
+    const timestamp = Date.now();
+    const key = `snapshot:${instrument}:${timestamp}`;
+    const data = JSON.stringify({
+      instrument,
+      timestamp,
+      bids: bookData.bids,
+      asks: bookData.asks,
+      spread: bookData.spread
+    });
+    
+    await this.redis.set(key, data, { EX: 86400 });  // 24-hour TTL
+    
+    // Keep reference to latest snapshot
+    await this.redis.set(`snapshot:${instrument}:latest`, key, { EX: 86400 });
+    
+    return key;
+  }
+
+  /**
+   * Get latest snapshot for an instrument
+   * @param {string} instrument - Instrument name
+   * @returns {Promise<object|null>} Latest snapshot or null
+   */
+  async getLatestSnapshot(instrument) {
+    const refKey = `snapshot:${instrument}:latest`;
+    const snapshotKey = await this.redis.get(refKey);
+    
+    if (!snapshotKey) {
+      return null;
+    }
+    
+    const snapshotData = await this.redis.get(snapshotKey);
+    return snapshotData ? JSON.parse(snapshotData) : null;
+  }
+
+  /**
+   * Batch insert metrics
+   * @param {object} metrics - Object with metric names and values
+   */
+  async batchIncrementMetrics(metrics) {
+    for (const [name, value] of Object.entries(metrics)) {
+      const key = `metrics:${name}`;
+      await this.redis.incrBy(key, value);
+    }
+  }
+
+  /**
+   * Get all active instruments
+   * @returns {Promise<Array>} List of instruments with orders
+   */
+  async getActiveInstruments() {
+    const pattern = 'instrument:orders:*';
+    const keys = await this.redis.keys(pattern);
+    return keys.map(key => key.replace('instrument:orders:', ''));
+  }
+
+  /**
+   * Get order book statistics
+   * @returns {Promise<object>} Statistics about order book
+   */
+  async getOrderBookStats() {
+    const instruments = await this.getActiveInstruments();
+    const stats = {};
+    
+    for (const instrument of instruments) {
+      const bidKey = `orderbook:${instrument}:buy`;
+      const askKey = `orderbook:${instrument}:sell`;
+      
+      const bidCount = await this.redis.zCard(bidKey);
+      const askCount = await this.redis.zCard(askKey);
+      
+      stats[instrument] = {
+        bidOrders: bidCount,
+        askOrders: askCount,
+        totalOrders: bidCount + askCount
+      };
+    }
+    
+    return stats;
+  }
+
+  /**
+   * Flush all trading data (use with caution!)
+   * @param {string} instrument - Optional: flush specific instrument only
+   */
+  async flushTradingData(instrument = null) {
+    if (instrument) {
+      const pattern = `*${instrument}*`;
+      const keys = await this.redis.keys(pattern);
+      if (keys.length > 0) {
+        await this.redis.del(keys);
+      }
+    } else {
+      // Clear all trading keys
+      const patterns = [
+        'orderbook:*',
+        'order:*',
+        'trades:*',
+        'client:orders:*',
+        'instrument:orders:*',
+        'order:status:*',
+        'snapshot:*'
+      ];
+      
+      for (const pattern of patterns) {
+        const keys = await this.redis.keys(pattern);
+        if (keys.length > 0) {
+          await this.redis.del(keys);
+        }
+      }
+    }
+  }
+
+  /**
+   * Get detailed diagnostics
+   * @returns {Promise<object>} Diagnostics info
+   */
+  async getDiagnostics() {
+    const instruments = await this.getActiveInstruments();
+    const bookStats = await this.getOrderBookStats();
+    const queueSize = await this.getPersistenceQueueSize();
+    const health = await this.healthCheck();
+    
+    return {
+      health,
+      queueSize,
+      instruments,
+      bookStats,
+      timestamp: new Date()
+    };
+  }
 }
 
 module.exports = RedisService;
