@@ -2,8 +2,12 @@ const express = require('express');
 const { DBForge } = require('./db');
 const { createRedisService } = require('./redis');
 
-// Import routes
+// Import route modules
 const orderRoutes = require('./routes/order.routes');
+const healthRoutes = require('./routes/health/health.routes');
+const tradesRoutes = require('./routes/trades/trades.routes');
+const metricsRoutes = require('./routes/metrics/metrics.routes');
+const analyticsRoutes = require('./routes/analytics/analytics.routes');
 
 const app = express();
 app.use(express.json());
@@ -13,11 +17,6 @@ const pool = DBForge.createPoolFromEnv();
 
 // Redis Service - will be initialized on server start
 let redisService = null;
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'OK', message: 'Server is healthy' });
-});
 
 // Root endpoint - Test Redis + MySQL connection
 app.get('/', async (req, res) => {
@@ -46,8 +45,12 @@ app.get('/', async (req, res) => {
     }
 });
 
-// Use order routes
+// Mount route modules
 app.use('/api/orders', orderRoutes);
+app.use('/api/trades', tradesRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/metrics', metricsRoutes);
+app.use('/', healthRoutes);
 
 // Server startup with Redis initialization
 async function startServer() {

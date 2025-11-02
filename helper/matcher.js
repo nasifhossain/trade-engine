@@ -51,9 +51,9 @@ class MatchingEngine {
 
             console.log('✅ Matching engine initialized successfully');
             
-            // Get book statistics from Redis
-            const stats = await this._getOrderBookStats();
-            console.log(`📊 Order book: ${stats.bidLevels} bid levels (${bidsLoaded} orders), ${stats.askLevels} ask levels (${asksLoaded} orders)`);
+            // Get book statistics from Redis for default instrument
+            const stats = await this._getOrderBookStats('BTC-USD');
+            console.log(`📊 Order book (BTC-USD): ${stats.bidLevels} bid levels (${bidsLoaded} orders), ${stats.askLevels} ask levels (${asksLoaded} orders)`);
             
             if (stats.bestBid || stats.bestAsk) {
                 console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
@@ -453,10 +453,13 @@ class MatchingEngine {
             );
 
             // Update status in database
-            await DB.update('orders', { order_id: orderId }, {
-                status: 'cancelled',
-                updated_at: new Date()
-            });
+            await DB.update('orders', 
+                {
+                    status: 'cancelled',
+                    updated_at: new Date()
+                },
+                { order_id: orderId }
+            );
 
             // Update Redis cache
             await this.redisService.updateOrderStatus(orderId, 'cancelled', order.filled_quantity);
@@ -549,12 +552,13 @@ class MatchingEngine {
 
     /**
      * Get order book statistics from Redis
+     * @param {string} instrument - Trading instrument (e.g., 'BTC-USD')
      */
-    async _getOrderBookStats() {
+    async _getOrderBookStats(instrument = 'BTC-USD') {
         try {
-            // Get top bids and asks
-            const bids = await this.redisService.getTopOrders('*', 'buy', 1000);
-            const asks = await this.redisService.getTopOrders('*', 'sell', 1000);
+            // Get top bids and asks for the specific instrument
+            const bids = await this.redisService.getTopOrders(instrument, 'buy', 1000);
+            const asks = await this.redisService.getTopOrders(instrument, 'sell', 1000);
 
             const bestBid = bids.length > 0 ? bids[0].price : null;
             const bestAsk = asks.length > 0 ? asks[0].price : null;
