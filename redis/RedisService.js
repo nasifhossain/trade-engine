@@ -125,7 +125,7 @@ class RedisService {
       client_id: orderData.client_id,
       instrument: orderData.instrument,
       side: orderData.side,
-      order_type: orderData.order_type,
+      type: orderData.type,
       price: orderData.price?.toString() || '0',
       quantity: orderData.quantity.toString(),
       filled_quantity: orderData.filled_quantity?.toString() || '0',

@@ -84,16 +84,28 @@ class OrderServices {
                 throw new Error('Failed to insert order into database');
             }
 
-            // Fetch the created order to return with timestamps
-            const createdOrder = await DB.find_one('orders', { order_id });
+            // Construct the created order response (no extra DB fetch for performance)
+            // Timestamps will be within milliseconds of actual DB values
+            const now = new Date();
+            const createdOrder = {
+                ...orderToInsert,
+                created_at: now,
+                updated_at: now
+            };
 
-            // Cache the order in Redis for quick access
-            const cacheKey = `order:${order_id}`;
-            await this.redisService.redis.setEx(
-                cacheKey, 
-                300, // 5 minutes TTL
-                JSON.stringify(createdOrder)
-            );
+            // Cache the order in Redis using the dedicated method
+            await this.redisService.storeOrderDetails(order_id, createdOrder);
+
+            // Add order to the orderbook (only for limit orders that are open/partially_filled)
+            if (type === 'limit' && ['open', 'partially_filled'].includes(status)) {
+                await this.redisService.addOrderToBook(
+                    instrument,
+                    side,
+                    parseFloat(price),
+                    order_id,
+                    now.getTime() // Timestamp in milliseconds
+                );
+            }
 
             return {
                 success: true,
