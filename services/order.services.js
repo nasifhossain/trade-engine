@@ -175,15 +175,20 @@ class OrderServices {
      */
     async getOrderById(orderId) {
         try {
-            // Try cache first
             const cacheKey = `order:${orderId}`;
-            const cached = await this.redisService.redis.get(cacheKey);
-            if (cached) {
-                return {
-                    success: true,
-                    source: 'cache',
-                    order: JSON.parse(cached)
-                };
+            
+            // Try to get from Redis HASH first (where it's stored)
+            try {
+                const cachedHash = await this.redisService.redis.hGetAll(cacheKey);
+                if (cachedHash && Object.keys(cachedHash).length > 0) {
+                    return {
+                        success: true,
+                        source: 'cache',
+                        order: cachedHash
+                    };
+                }
+            } catch (cacheError) {
+                console.warn(`Redis HASH retrieval error for ${cacheKey}:`, cacheError.message);
             }
 
             // Get from database
@@ -192,8 +197,14 @@ class OrderServices {
                 throw new Error('Order not found');
             }
 
-            // Cache it
-            await this.redisService.redis.setEx(cacheKey, 300, JSON.stringify(order));
+            // Cache it as a HASH (matching how matcher stores it)
+            try {
+                await this.redisService.redis.hSet(cacheKey, order);
+                await this.redisService.redis.expire(cacheKey, 300); // 5 minute TTL
+            } catch (cacheError) {
+                console.warn(`Failed to cache order in Redis:`, cacheError.message);
+                // Continue anyway, order is available from DB
+            }
 
             return {
                 success: true,
@@ -263,7 +274,7 @@ class OrderServices {
                 query = query.where('instrument', instrument);
             }
 
-            query = query.order_by('timestamp', 'DESC').limit(limit, offset);
+            query = query.order_by('executed_at', 'DESC').limit(limit, offset);
 
             const trades = await query.get();
 
