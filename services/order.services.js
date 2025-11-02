@@ -407,11 +407,9 @@ class OrderServices {
             // *** RUN MATCHING ENGINE FOR SELL ORDERS! ***
             const matchResult = await this.matchingEngine.processOrder(createdOrder);
 
-            // Get updated order after matching
-            const updatedOrder = await DB.find_one('orders', { order_id });
-
+            // createdOrder is now updated by matching engine (passed by reference)
             // Update Redis with final order state
-            await this.redisService.storeOrderDetails(order_id, updatedOrder);
+            await this.redisService.storeOrderDetails(order_id, createdOrder);
 
             // Add recent trades to Redis for fast access
             for (const trade of matchResult.trades) {
@@ -443,7 +441,7 @@ class OrderServices {
             return {
                 success: true,
                 message: 'Sell order created successfully',
-                order: updatedOrder,
+                order: createdOrder,
                 match_result: {
                     trades_executed: matchResult.trades.length,
                     trades: matchResult.trades,
@@ -661,11 +659,9 @@ class OrderServices {
             // *** RUN MATCHING ENGINE FOR BUY ORDERS! ***
             const matchResult = await this.matchingEngine.processOrder(createdOrder);
 
-            // Get updated order after matching
-            const updatedOrder = await DB.find_one('orders', { order_id });
-
+            // createdOrder is now updated by matching engine (passed by reference)
             // Update Redis with final order state
-            await this.redisService.storeOrderDetails(order_id, updatedOrder);
+            await this.redisService.storeOrderDetails(order_id, createdOrder);
 
             // Add recent trades to Redis for fast access
             for (const trade of matchResult.trades) {
@@ -697,7 +693,7 @@ class OrderServices {
             return {
                 success: true,
                 message: 'Buy order created successfully',
-                order: updatedOrder,
+                order: createdOrder,
                 match_result: {
                     trades_executed: matchResult.trades.length,
                     trades: matchResult.trades,
