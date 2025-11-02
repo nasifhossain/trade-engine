@@ -43,12 +43,38 @@ class OrderServices {
         try {
             const { side } = orderData;
 
-            // Check idempotency if key provided
+            // ========== HYBRID IDEMPOTENCY CHECK ==========
+            // Check both Redis (fast) and SQL (durable) for idempotency
             if (idempotencyKey) {
-                const cacheKey = `idempotency:${idempotencyKey}`;
-                const cached = await this.redisService.redis.get(cacheKey);
-                if (cached) {
-                    return JSON.parse(cached);
+                // 1. Check Redis cache first (fastest path)
+                const redisCacheKey = `idempotency:${idempotencyKey}`;
+                const redisCached = await this.redisService.redis.get(redisCacheKey);
+                if (redisCached) {
+                    console.log(`✅ Idempotency hit (Redis): ${idempotencyKey}`);
+                    return JSON.parse(redisCached);
+                }
+
+                // 2. Check SQL database (durable, survives Redis restart)
+                const sqlCached = await DB.find_one('idempotency_keys', { 
+                    idempotency_key: idempotencyKey 
+                });
+                
+                if (sqlCached) {
+                    console.log(`✅ Idempotency hit (SQL): ${idempotencyKey}`);
+                    
+                    // Parse stored response
+                    const cachedResponse = typeof sqlCached.response_data === 'string' 
+                        ? JSON.parse(sqlCached.response_data)
+                        : sqlCached.response_data;
+                    
+                    // Re-cache in Redis for future fast lookups
+                    await this.redisService.redis.setEx(
+                        redisCacheKey,
+                        3600,
+                        JSON.stringify(cachedResponse)
+                    );
+                    
+                    return cachedResponse;
                 }
             }
 
@@ -73,15 +99,39 @@ class OrderServices {
                 result = await this.createBuyOrder(orderData);
             }
 
-            // Cache idempotency result if key provided
+            // ========== STORE IDEMPOTENCY IN BOTH REDIS AND SQL ==========
             if (idempotencyKey && result) {
-                const idempotencyCacheKey = `idempotency:${idempotencyKey}`;
-                await this.redisService.redis.setEx(
-                    idempotencyCacheKey,
-                    3600, // 1 hour TTL
-                    JSON.stringify(result)
-                );
-                console.log(`✅ Idempotency key cached: ${idempotencyKey}`);
+                const order_id = result.order?.order_id;
+                
+                if (order_id) {
+                    // 1. Store in SQL (durable, permanent record)
+                    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+                    
+                    try {
+                        await DB.insert('idempotency_keys', {
+                            idempotency_key: idempotencyKey,
+                            order_id: order_id,
+                            response_data: JSON.stringify(result),
+                            http_status: 201,
+                            expires_at: expiresAt
+                        });
+                        console.log(`✅ Idempotency stored in SQL: ${idempotencyKey} -> ${order_id}`);
+                    } catch (sqlError) {
+                        // If duplicate key error (race condition), it's okay - another request already stored it
+                        if (!sqlError.message.includes('Duplicate entry')) {
+                            console.error('Error storing idempotency in SQL:', sqlError);
+                        }
+                    }
+                    
+                    // 2. Store in Redis (fast lookups)
+                    const idempotencyCacheKey = `idempotency:${idempotencyKey}`;
+                    await this.redisService.redis.setEx(
+                        idempotencyCacheKey,
+                        3600, // 1 hour TTL
+                        JSON.stringify(result)
+                    );
+                    console.log(`✅ Idempotency cached in Redis: ${idempotencyKey}`);
+                }
             }
 
             return result;
