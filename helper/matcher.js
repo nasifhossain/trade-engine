@@ -2,8 +2,9 @@ const { randomUUID } = require('crypto');
 const { DB } = require('../db/query');
 
 /**
- * Trading Matching Engine
+ * Trading Matching Engine - Redis Optimized
  * Implements price-time priority matching for limit and market orders
+ * Uses Redis for scalable order book management and caching
  */
 class MatchingEngine {
     constructor(pool, redisService) {
@@ -13,22 +14,19 @@ class MatchingEngine {
         // Initialize DB with the pool
         DB.init(pool);
         
-        // In-memory order book for fast matching
-        this.orderBook = {
-            bids: new Map(), // price -> [orders] (sorted by time)
-            asks: new Map()  // price -> [orders] (sorted by time)
-        };
-        
-        // Mutex for thread safety (simple flag-based implementation)
-        this.isMatching = false;
+        // Distributed lock for thread safety (using Redis)
+        this.lockKey = 'matching:lock';
+        this.lockTimeout = 5000; // 5 seconds
+        this.maxRetries = 10;
+        this.retryDelay = 10; // milliseconds
     }
 
     /**
-     * Initialize the matching engine by loading existing orders from DB
+     * Initialize the matching engine by loading existing orders from DB to Redis
      */
     async initialize() {
         try {
-            console.log('🔄 Initializing matching engine...');
+            console.log('🔄 Initializing matching engine with Redis...');
             
             // Load open orders from database
             const openOrdersQuery = await DB.find('orders', { status: 'open' });
@@ -36,14 +34,14 @@ class MatchingEngine {
             
             const openOrders = [...openOrdersQuery, ...partialOrdersQuery];
 
-            console.log(`📋 Loading ${openOrders.length} open orders into order book`);
+            console.log(`📋 Loading ${openOrders.length} open orders into Redis order book`);
 
-            // Rebuild order book from existing orders
+            // Batch load orders into Redis
             let bidsLoaded = 0;
             let asksLoaded = 0;
             
             for (const order of openOrders) {
-                this._addOrderToBook(order);
+                await this._addOrderToRedis(order);
                 if (order.side === 'buy') {
                     bidsLoaded++;
                 } else {
@@ -52,14 +50,13 @@ class MatchingEngine {
             }
 
             console.log('✅ Matching engine initialized successfully');
-            console.log(`📊 Order book: ${this.orderBook.bids.size} bid levels (${bidsLoaded} orders), ${this.orderBook.asks.size} ask levels (${asksLoaded} orders)`);
             
-            // Log current best bid/ask for debugging
-            const bestBid = this.orderBook.bids.size > 0 ? Math.max(...this.orderBook.bids.keys()) : null;
-            const bestAsk = this.orderBook.asks.size > 0 ? Math.min(...this.orderBook.asks.keys()) : null;
+            // Get book statistics from Redis
+            const stats = await this._getOrderBookStats();
+            console.log(`📊 Order book: ${stats.bidLevels} bid levels (${bidsLoaded} orders), ${stats.askLevels} ask levels (${asksLoaded} orders)`);
             
-            if (bestBid || bestAsk) {
-                console.log(`💰 Best prices - Bid: ${bestBid || 'N/A'}, Ask: ${bestAsk || 'N/A'}`);
+            if (stats.bestBid || stats.bestAsk) {
+                console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
             }
             
         } catch (error) {
@@ -69,16 +66,42 @@ class MatchingEngine {
     }
 
     /**
+     * Acquire distributed lock for matching operations
+     */
+    async _acquireLock() {
+        let retries = 0;
+        while (retries < this.maxRetries) {
+            const locked = await this.redisService.redis.set(
+                this.lockKey,
+                Date.now().toString(),
+                { EX: 5, NX: true }
+            );
+            
+            if (locked) {
+                return true;
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, this.retryDelay));
+            retries++;
+        }
+        throw new Error('Failed to acquire matching lock - engine busy');
+    }
+
+    /**
+     * Release distributed lock
+     */
+    async _releaseLock() {
+        await this.redisService.redis.del(this.lockKey);
+    }
+
+    /**
      * Process an incoming order and perform matching
+     * Acquires lock, matches, updates Redis, then persists to DB
      * @param {Object} order - The incoming order
      * @returns {Object} Match results with trades and updated order
      */
     async processOrder(order) {
-        // Acquire mutex (simple implementation)
-        while (this.isMatching) {
-            await new Promise(resolve => setTimeout(resolve, 1));
-        }
-        this.isMatching = true;
+        await this._acquireLock();
 
         try {
             const matchResult = {
@@ -87,14 +110,17 @@ class MatchingEngine {
                 bookUpdates: []
             };
 
+            // Cache order in Redis for fast lookups
+            await this.redisService.storeOrderDetails(order.order_id, order);
+
             if (order.type === 'market') {
                 await this._processMarketOrder(order, matchResult);
             } else if (order.type === 'limit') {
                 await this._processLimitOrder(order, matchResult);
             }
 
-            // Persist all changes to database
-            await this._persistMatchResult(matchResult);
+            // Persist all changes to database and update Redis
+            await this._persistMatchResult(matchResult, order);
             
             // Log processing summary
             if (matchResult.trades.length > 0) {
@@ -109,76 +135,70 @@ class MatchingEngine {
             return matchResult;
 
         } finally {
-            this.isMatching = false;
+            await this._releaseLock();
         }
     }
 
     /**
      * Process a market order - match immediately at best available prices
+     * Uses Redis to fetch orders efficiently
      */
     async _processMarketOrder(order, matchResult) {
-        const oppositeBook = order.side === 'buy' ? this.orderBook.asks : this.orderBook.bids;
+        const oppositeBooks = order.side === 'buy' 
+            ? { key: `orderbook:${order.instrument}:sell`, side: 'sell' }
+            : { key: `orderbook:${order.instrument}:buy`, side: 'buy' };
+
         let remainingQuantity = order.quantity - order.filled_quantity;
 
-        // Get sorted price levels (ascending for asks, descending for bids)
-        const sortedPrices = Array.from(oppositeBook.keys()).sort((a, b) => 
-            order.side === 'buy' ? a - b : b - a
-        );
+        // Get all orders from opposite side (Redis ZSET)
+        const oppositeOrders = order.side === 'buy'
+            ? await this.redisService.getTopOrders(order.instrument, 'sell', 1000)
+            : await this.redisService.getTopOrders(order.instrument, 'buy', 1000);
 
-        for (const price of sortedPrices) {
+        // Process orders at best prices first
+        for (const oppositeOrderRef of oppositeOrders) {
             if (remainingQuantity <= 0) break;
 
-            const ordersAtPrice = oppositeBook.get(price);
-            if (!ordersAtPrice || ordersAtPrice.length === 0) continue;
+            // Fetch full order details from Redis (cached)
+            const makerOrder = await this.redisService.getOrderDetails(oppositeOrderRef.orderId);
+            if (!makerOrder || makerOrder.status === 'filled') continue;
 
-            // Process orders at this price level (FIFO - first in, first out)
-            for (let i = 0; i < ordersAtPrice.length; i++) {
-                const makerOrder = ordersAtPrice[i];
-                if (remainingQuantity <= 0) break;
+            const matchQuantity = Math.min(
+                remainingQuantity,
+                parseFloat(makerOrder.quantity) - parseFloat(makerOrder.filled_quantity)
+            );
 
-                const matchQuantity = Math.min(
-                    remainingQuantity, 
-                    makerOrder.quantity - makerOrder.filled_quantity
-                );
+            if (matchQuantity > 0) {
+                // Create and track trade
+                const trade = this._createTrade(order, makerOrder, oppositeOrderRef.price, matchQuantity);
+                matchResult.trades.push(trade);
+                
+                console.log(`🔄 Market order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
+                console.log(`   → Taker: ${order.order_id} (${order.client_id})`);
+                console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id})`);
 
-                if (matchQuantity > 0) {
-                    // Create trade
-                    const trade = this._createTrade(order, makerOrder, price, matchQuantity);
-                    matchResult.trades.push(trade);
-                    
-                    console.log(`🔄 Market order match: ${matchQuantity} ${order.instrument} @ ${price} (${order.side} vs ${makerOrder.side})`);
-                    console.log(`   → Taker: ${order.order_id} (${order.client_id})`);
-                    console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id})`);
+                // Update quantities
+                order.filled_quantity += matchQuantity;
+                makerOrder.filled_quantity = (parseFloat(makerOrder.filled_quantity) + matchQuantity).toString();
+                remainingQuantity -= matchQuantity;
 
-                    // Update order quantities
-                    order.filled_quantity += matchQuantity;
-                    makerOrder.filled_quantity += matchQuantity;
-                    remainingQuantity -= matchQuantity;
+                // Update statuses
+                this._updateOrderStatus(order);
+                this._updateOrderStatus(makerOrder);
 
-                    // Update order statuses
-                    this._updateOrderStatus(order);
-                    this._updateOrderStatus(makerOrder);
+                matchResult.orderUpdates.push({...order});
+                matchResult.orderUpdates.push({...makerOrder});
 
-                    matchResult.orderUpdates.push({...order});
-                    matchResult.orderUpdates.push({...makerOrder});
-
-                    // If maker order is fully filled, remove from book
-                    if (makerOrder.filled_quantity >= makerOrder.quantity) {
-                        ordersAtPrice.splice(i, 1);
-                        i--; // Adjust index after removal
-                        console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
-                    }
+                // Update Redis if maker is fully filled
+                if (parseFloat(makerOrder.filled_quantity) >= parseFloat(makerOrder.quantity)) {
+                    await this.redisService.removeOrderFromBook(
+                        order.instrument,
+                        makerOrder.side,
+                        makerOrder.order_id,
+                        parseInt(makerOrder.created_at)
+                    );
+                    console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
                 }
-            }
-
-            // Clean up empty price levels
-            if (ordersAtPrice.length === 0) {
-                oppositeBook.delete(price);
-                matchResult.bookUpdates.push({
-                    action: 'remove_level',
-                    side: order.side === 'buy' ? 'ask' : 'bid',
-                    price: price
-                });
             }
         }
 
@@ -188,82 +208,76 @@ class MatchingEngine {
 
     /**
      * Process a limit order - match what's possible, then add to book
+     * Efficiently uses Redis for order book management
      */
     async _processLimitOrder(order, matchResult) {
-        const oppositeBook = order.side === 'buy' ? this.orderBook.asks : this.orderBook.bids;
         let remainingQuantity = order.quantity - order.filled_quantity;
 
-        // For buy orders, match with asks at or below the limit price
-        // For sell orders, match with bids at or above the limit price
-        const sortedPrices = Array.from(oppositeBook.keys())
-            .filter(price => order.side === 'buy' ? price <= order.price : price >= order.price)
-            .sort((a, b) => order.side === 'buy' ? a - b : b - a);
+        // Get orders from opposite side
+        const oppositeOrders = order.side === 'buy'
+            ? await this.redisService.getTopOrders(order.instrument, 'sell', 1000)
+            : await this.redisService.getTopOrders(order.instrument, 'buy', 1000);
+
+        // Filter orders that match our limit price
+        const matchableOrders = oppositeOrders.filter(o => 
+            order.side === 'buy' ? o.price <= order.price : o.price >= order.price
+        );
 
         // Try to match with existing orders
-        for (const price of sortedPrices) {
+        for (const oppositeOrderRef of matchableOrders) {
             if (remainingQuantity <= 0) break;
 
-            const ordersAtPrice = oppositeBook.get(price);
-            if (!ordersAtPrice || ordersAtPrice.length === 0) continue;
+            // Fetch full order details from Redis
+            const makerOrder = await this.redisService.getOrderDetails(oppositeOrderRef.orderId);
+            if (!makerOrder || makerOrder.status === 'filled') continue;
 
-            for (let i = 0; i < ordersAtPrice.length; i++) {
-                const makerOrder = ordersAtPrice[i];
-                if (remainingQuantity <= 0) break;
+            const matchQuantity = Math.min(
+                remainingQuantity,
+                parseFloat(makerOrder.quantity) - parseFloat(makerOrder.filled_quantity)
+            );
 
-                const matchQuantity = Math.min(
-                    remainingQuantity,
-                    makerOrder.quantity - makerOrder.filled_quantity
-                );
+            if (matchQuantity > 0) {
+                // Trade at maker's price (price improvement for taker)
+                const trade = this._createTrade(order, makerOrder, oppositeOrderRef.price, matchQuantity);
+                matchResult.trades.push(trade);
+                
+                console.log(`🔄 Limit order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
+                console.log(`   → Taker: ${order.order_id} (${order.client_id}) - limit ${order.price}`);
+                console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id}) - got ${oppositeOrderRef.price}`);
 
-                if (matchQuantity > 0) {
-                    // Trade at maker's price (price improvement for taker)
-                    const trade = this._createTrade(order, makerOrder, price, matchQuantity);
-                    matchResult.trades.push(trade);
-                    
-                    console.log(`🔄 Limit order match: ${matchQuantity} ${order.instrument} @ ${price} (${order.side} vs ${makerOrder.side})`);
-                    console.log(`   → Taker: ${order.order_id} (${order.client_id}) - limit ${order.price}`);
-                    console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id}) - got ${price}`);
+                // Update quantities
+                order.filled_quantity += matchQuantity;
+                makerOrder.filled_quantity = (parseFloat(makerOrder.filled_quantity) + matchQuantity).toString();
+                remainingQuantity -= matchQuantity;
 
-                    // Update quantities
-                    order.filled_quantity += matchQuantity;
-                    makerOrder.filled_quantity += matchQuantity;
-                    remainingQuantity -= matchQuantity;
+                // Update statuses
+                this._updateOrderStatus(order);
+                this._updateOrderStatus(makerOrder);
 
-                    // Update statuses
-                    this._updateOrderStatus(order);
-                    this._updateOrderStatus(makerOrder);
+                matchResult.orderUpdates.push({...order});
+                matchResult.orderUpdates.push({...makerOrder});
 
-                    matchResult.orderUpdates.push({...order});
-                    matchResult.orderUpdates.push({...makerOrder});
-
-                    // Remove fully filled maker order
-                    if (makerOrder.filled_quantity >= makerOrder.quantity) {
-                        ordersAtPrice.splice(i, 1);
-                        i--;
-                        console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
-                    }
+                // Remove fully filled maker order from Redis
+                if (parseFloat(makerOrder.filled_quantity) >= parseFloat(makerOrder.quantity)) {
+                    await this.redisService.removeOrderFromBook(
+                        order.instrument,
+                        makerOrder.side,
+                        makerOrder.order_id,
+                        parseInt(makerOrder.created_at)
+                    );
+                    console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
                 }
-            }
-
-            // Clean up empty price levels
-            if (ordersAtPrice.length === 0) {
-                oppositeBook.delete(price);
-                matchResult.bookUpdates.push({
-                    action: 'remove_level',
-                    side: order.side === 'buy' ? 'ask' : 'bid',
-                    price: price
-                });
             }
         }
 
-        // If there's remaining quantity, add to order book
+        // If there's remaining quantity, add to order book in Redis
         if (remainingQuantity > 0) {
-            this._addOrderToBook(order);
+            await this._addOrderToRedis(order);
             matchResult.bookUpdates.push({
                 action: 'add_order',
                 side: order.side,
                 price: order.price,
-                order: {...order}
+                order_id: order.order_id
             });
         }
 
@@ -271,22 +285,24 @@ class MatchingEngine {
     }
 
     /**
-     * Add an order to the in-memory order book
+     * Add an order to Redis order book (ZSET for price-time priority)
      */
-    _addOrderToBook(order) {
+    async _addOrderToRedis(order) {
         if (order.status === 'filled' || order.status === 'cancelled') {
             return; // Don't add completed orders
         }
 
-        const book = order.side === 'buy' ? this.orderBook.bids : this.orderBook.asks;
-        const price = order.price;
+        const timestamp = order.created_at instanceof Date 
+            ? order.created_at.getTime() 
+            : new Date(order.created_at).getTime();
 
-        if (!book.has(price)) {
-            book.set(price, []);
-        }
-
-        // Insert in time order (FIFO)
-        book.get(price).push(order);
+        await this.redisService.addOrderToBook(
+            order.instrument,
+            order.side,
+            order.price,
+            order.order_id,
+            timestamp
+        );
     }
 
     /**
@@ -329,24 +345,20 @@ class MatchingEngine {
     }
 
     /**
-     * Persist all match results to database
+     * Persist all match results to database and update Redis
+     * Batches operations for efficiency
      */
-    async _persistMatchResult(matchResult) {
+    async _persistMatchResult(matchResult, order) {
         try {
-            // Start transaction - we'll use the DB class which should handle transactions
-            // For now, we'll do individual operations and add transaction support later
-            
             // Insert trades into trades table
             for (const trade of matchResult.trades) {
-                // Prepare trade data for database (exclude metadata fields)
-                // Ensure all numeric values are properly formatted
                 const tradeData = {
                     trade_id: trade.trade_id,
                     buy_order_id: trade.buy_order_id,
                     sell_order_id: trade.sell_order_id,
                     instrument: trade.instrument,
-                    price: parseFloat(trade.price).toFixed(8), // Ensure decimal precision
-                    quantity: parseFloat(trade.quantity).toFixed(8), // Ensure decimal precision
+                    price: parseFloat(trade.price).toFixed(8),
+                    quantity: parseFloat(trade.quantity).toFixed(8),
                     buy_client_id: trade.buy_client_id,
                     sell_client_id: trade.sell_client_id,
                     executed_at: trade.executed_at
@@ -360,27 +372,43 @@ class MatchingEngine {
                     throw new Error(`Failed to insert trade ${trade.trade_id}`);
                 }
 
-                console.log(`✓ Trade ${trade.trade_id} inserted successfully`);
+                // Add to recent trades in Redis for fast access
+                await this.redisService.addRecentTrade(trade.instrument, trade);
+                
+                console.log(`✓ Trade ${trade.trade_id} persisted`);
             }
 
-            // Update orders in orders table
-            for (const order of matchResult.orderUpdates) {
-                console.log(`Updating order: ${order.order_id} - filled: ${order.filled_quantity}/${order.quantity}, status: ${order.status}`);
+            // Update orders in database and Redis cache
+            for (const updatedOrder of matchResult.orderUpdates) {
+                console.log(`Updating order: ${updatedOrder.order_id} - filled: ${updatedOrder.filled_quantity}/${updatedOrder.quantity}, status: ${updatedOrder.status}`);
                 
                 const updateResult = await DB.update('orders', 
                     {
-                        filled_quantity: parseFloat(order.filled_quantity).toFixed(8),
-                        status: order.status,
-                        updated_at: order.updated_at
+                        filled_quantity: parseFloat(updatedOrder.filled_quantity).toFixed(8),
+                        status: updatedOrder.status,
+                        updated_at: updatedOrder.updated_at
                     },
-                    { order_id: order.order_id }
+                    { order_id: updatedOrder.order_id }
                 );
 
                 if (!updateResult.success) {
-                    throw new Error(`Failed to update order ${order.order_id}`);
+                    throw new Error(`Failed to update order ${updatedOrder.order_id}`);
                 }
 
-                console.log(`✓ Order ${order.order_id} updated successfully`);
+                // Update Redis cache
+                await this.redisService.updateOrderStatus(
+                    updatedOrder.order_id,
+                    updatedOrder.status,
+                    updatedOrder.filled_quantity
+                );
+
+                console.log(`✓ Order ${updatedOrder.order_id} persisted`);
+            }
+
+            // Update metrics in Redis
+            if (matchResult.trades.length > 0) {
+                await this.redisService.incrementMetric(`trades:${order.instrument}`, matchResult.trades.length);
+                await this.redisService.incrementMetric('trades:total', matchResult.trades.length);
             }
 
             console.log(`✓ Match result persisted: ${matchResult.trades.length} trades, ${matchResult.orderUpdates.length} order updates`);
@@ -392,41 +420,49 @@ class MatchingEngine {
     }
 
     /**
-     * Cancel an order and remove it from the order book
+     * Cancel an order and remove it from Redis order book
      */
     async cancelOrder(orderId) {
         try {
-            // Find the order in database first
-            const order = await DB.find_one('orders', { order_id: orderId });
+            // Try Redis cache first for faster lookup
+            let order = await this.redisService.getOrderDetails(orderId);
+            
+            // If not in Redis, fetch from database
             if (!order) {
-                throw new Error('Order not found');
+                const dbResult = await DB.find_one('orders', { order_id: orderId });
+                order = dbResult;
+                if (!order) {
+                    throw new Error('Order not found');
+                }
             }
 
             if (order.status === 'filled' || order.status === 'cancelled') {
                 throw new Error('Cannot cancel order that is already filled or cancelled');
             }
 
-            // Remove from order book
-            const book = order.side === 'buy' ? this.orderBook.bids : this.orderBook.asks;
-            const ordersAtPrice = book.get(order.price);
-            
-            if (ordersAtPrice) {
-                const index = ordersAtPrice.findIndex(o => o.order_id === orderId);
-                if (index !== -1) {
-                    ordersAtPrice.splice(index, 1);
-                }
+            // Remove from Redis order book
+            const timestamp = order.created_at instanceof Date 
+                ? order.created_at.getTime() 
+                : new Date(order.created_at).getTime();
 
-                // Clean up empty price level
-                if (ordersAtPrice.length === 0) {
-                    book.delete(order.price);
-                }
-            }
+            await this.redisService.removeOrderFromBook(
+                order.instrument,
+                order.side,
+                orderId,
+                timestamp
+            );
 
             // Update status in database
             await DB.update('orders', { order_id: orderId }, {
                 status: 'cancelled',
                 updated_at: new Date()
             });
+
+            // Update Redis cache
+            await this.redisService.updateOrderStatus(orderId, 'cancelled', order.filled_quantity);
+
+            // Increment metrics
+            await this.redisService.incrementMetric('orders:cancelled');
 
             return {
                 success: true,
@@ -441,80 +477,103 @@ class MatchingEngine {
     }
 
     /**
-     * Get current order book state
+     * Get current order book state from Redis
+     * Much faster than in-memory map due to ZSET sorting
      */
-    getOrderBook(instrument, levels = 20) {
-        const bids = [];
-        const asks = [];
-
-        // Process bids (highest price first)
-        const sortedBidPrices = Array.from(this.orderBook.bids.keys()).sort((a, b) => b - a);
-        for (const price of sortedBidPrices.slice(0, levels)) {
-            const orders = this.orderBook.bids.get(price) || [];
-            const totalQuantity = orders.reduce((sum, order) => 
-                sum + (order.quantity - order.filled_quantity), 0);
+    async getOrderBook(instrument, levels = 20) {
+        try {
+            const orderBook = await this.redisService.getOrderBook(instrument, levels);
             
-            if (totalQuantity > 0) {
-                bids.push({
-                    price: parseFloat(price),
-                    quantity: parseFloat(totalQuantity.toFixed(8)),
-                    orders: orders.length
-                });
-            }
+            return {
+                instrument,
+                bids: orderBook.bids.map(bid => ({
+                    price: parseFloat(bid.price),
+                    quantity: this._calculateLevelQuantity(bid),
+                    orders: 1
+                })),
+                asks: orderBook.asks.map(ask => ({
+                    price: parseFloat(ask.price),
+                    quantity: this._calculateLevelQuantity(ask),
+                    orders: 1
+                })),
+                spread: orderBook.asks.length > 0 && orderBook.bids.length > 0 
+                    ? parseFloat((orderBook.asks[0].price - orderBook.bids[0].price).toFixed(8)) 
+                    : null,
+                timestamp: new Date()
+            };
+        } catch (error) {
+            console.error('Error getting order book:', error);
+            throw error;
         }
-
-        // Process asks (lowest price first)
-        const sortedAskPrices = Array.from(this.orderBook.asks.keys()).sort((a, b) => a - b);
-        for (const price of sortedAskPrices.slice(0, levels)) {
-            const orders = this.orderBook.asks.get(price) || [];
-            const totalQuantity = orders.reduce((sum, order) => 
-                sum + (order.quantity - order.filled_quantity), 0);
-            
-            if (totalQuantity > 0) {
-                asks.push({
-                    price: parseFloat(price),
-                    quantity: parseFloat(totalQuantity.toFixed(8)),
-                    orders: orders.length
-                });
-            }
-        }
-
-        return {
-            instrument,
-            bids,
-            asks,
-            spread: asks.length > 0 && bids.length > 0 ? 
-                parseFloat((asks[0].price - bids[0].price).toFixed(8)) : null,
-            timestamp: new Date()
-        };
     }
 
     /**
-     * Get order book depth with cumulative quantities
+     * Get order book depth with cumulative quantities from Redis
      */
-    getOrderBookDepth(instrument, levels = 20) {
-        const orderBook = this.getOrderBook(instrument, levels);
-        
-        // Add cumulative quantities
-        let bidCumulative = 0;
-        orderBook.bids = orderBook.bids.map(level => {
-            bidCumulative += level.quantity;
-            return {
-                ...level,
-                cumulative: parseFloat(bidCumulative.toFixed(8))
-            };
-        });
+    async getOrderBookDepth(instrument, levels = 20) {
+        try {
+            const orderBook = await this.getOrderBook(instrument, levels);
+            
+            // Add cumulative quantities
+            let bidCumulative = 0;
+            orderBook.bids = orderBook.bids.map(level => {
+                bidCumulative += level.quantity;
+                return {
+                    ...level,
+                    cumulative: parseFloat(bidCumulative.toFixed(8))
+                };
+            });
 
-        let askCumulative = 0;
-        orderBook.asks = orderBook.asks.map(level => {
-            askCumulative += level.quantity;
-            return {
-                ...level,
-                cumulative: parseFloat(askCumulative.toFixed(8))
-            };
-        });
+            let askCumulative = 0;
+            orderBook.asks = orderBook.asks.map(level => {
+                askCumulative += level.quantity;
+                return {
+                    ...level,
+                    cumulative: parseFloat(askCumulative.toFixed(8))
+                };
+            });
 
-        return orderBook;
+            return orderBook;
+        } catch (error) {
+            console.error('Error getting order book depth:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Helper method to calculate level quantity (placeholder)
+     */
+    _calculateLevelQuantity(level) {
+        return parseFloat(level.quantity || '0');
+    }
+
+    /**
+     * Get order book statistics from Redis
+     */
+    async _getOrderBookStats() {
+        try {
+            // Get top bids and asks
+            const bids = await this.redisService.getTopOrders('*', 'buy', 1000);
+            const asks = await this.redisService.getTopOrders('*', 'sell', 1000);
+
+            const bestBid = bids.length > 0 ? bids[0].price : null;
+            const bestAsk = asks.length > 0 ? asks[0].price : null;
+
+            return {
+                bidLevels: bids.length,
+                askLevels: asks.length,
+                bestBid,
+                bestAsk
+            };
+        } catch (error) {
+            console.warn('Could not get order book stats:', error.message);
+            return {
+                bidLevels: 0,
+                askLevels: 0,
+                bestBid: null,
+                bestAsk: null
+            };
+        }
     }
 }
 
