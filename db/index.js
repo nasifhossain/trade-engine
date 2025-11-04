@@ -31,7 +31,7 @@ class DBForge {
       password: process.env.MYSQL_PASSWORD || 'rootpassword',
       database: process.env.MYSQL_DATABASE || 'twocents_db',
       waitForConnections: true,
-      connectionLimit: 10,
+      connectionLimit: 50, // Increased for high throughput (2000 RPS target)
       queueLimit: 0
     };
     

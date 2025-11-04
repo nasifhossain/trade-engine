@@ -14,11 +14,10 @@ class MatchingEngine {
         // Initialize DB with the pool
         DB.init(pool);
         
-        // Distributed lock for thread safety (using Redis)
-        this.lockKey = 'matching:lock';
+        // Distributed lock configuration (per-instrument locking for better concurrency)
         this.lockTimeout = 5000; // 5 seconds
-        this.maxRetries = 10;
-        this.retryDelay = 10; // milliseconds
+        this.maxRetries = 50; // Balanced for throughput (fail faster to avoid request pileup)
+        this.retryDelay = 2; // milliseconds (reduced for higher throughput)
     }
 
     /**
@@ -91,32 +90,37 @@ class MatchingEngine {
     }
 
     /**
-     * Acquire distributed lock for matching operations
+     * Acquire distributed lock for specific instrument (per-instrument locking)
+     * @param {String} instrument - The trading instrument (e.g., 'BTC-USD')
+     * @returns {String} lockKey - The acquired lock key
      */
-    async _acquireLock() {
+    async _acquireLock(instrument) {
+        const lockKey = `matching:lock:${instrument}`;
         let retries = 0;
+        
         while (retries < this.maxRetries) {
             const locked = await this.redisService.redis.set(
-                this.lockKey,
+                lockKey,
                 Date.now().toString(),
                 { EX: 5, NX: true }
             );
             
             if (locked) {
-                return true;
+                return lockKey;
             }
             
             await new Promise(resolve => setTimeout(resolve, this.retryDelay));
             retries++;
         }
-        throw new Error('Failed to acquire matching lock - engine busy');
+        throw new Error(`Failed to acquire matching lock for ${instrument} - too many concurrent orders`);
     }
 
     /**
-     * Release distributed lock
+     * Release distributed lock for specific instrument
+     * @param {String} lockKey - The lock key to release
      */
-    async _releaseLock() {
-        await this.redisService.redis.del(this.lockKey);
+    async _releaseLock(lockKey) {
+        await this.redisService.redis.del(lockKey);
     }
 
     /**
@@ -126,7 +130,8 @@ class MatchingEngine {
      * @returns {Object} Match results with trades and updated order
      */
     async processOrder(order) {
-        await this._acquireLock();
+        // Acquire per-instrument lock for better concurrency
+        const lockKey = await this._acquireLock(order.instrument);
 
         try {
             const matchResult = {
@@ -160,7 +165,7 @@ class MatchingEngine {
             return matchResult;
 
         } finally {
-            await this._releaseLock();
+            await this._releaseLock(lockKey);
         }
     }
 
