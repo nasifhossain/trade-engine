@@ -19,6 +19,9 @@ const pool = DBForge.createPoolFromEnv();
 // Redis Service - will be initialized on server start
 let redisService = null;
 
+// Snapshot Service - for fast recovery
+let snapshotService = null;
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'OK', message: 'Server is healthy' });
