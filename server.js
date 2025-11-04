@@ -2,13 +2,10 @@ const express = require('express');
 const { DBForge } = require('./db');
 const { createRedisService } = require('./redis');
 const SnapshotService = require('./services/snapshot.services');
+const OrderServices = require('./services/order.services');
 
 // Import route modules
 const orderRoutes = require('./routes/order.routes');
-const healthRoutes = require('./routes/health/health.routes');
-const tradesRoutes = require('./routes/trades/trades.routes');
-const metricsRoutes = require('./routes/metrics/metrics.routes');
-const analyticsRoutes = require('./routes/analytics/analytics.routes');
 
 const app = express();
 app.use(express.json());
@@ -21,6 +18,9 @@ let redisService = null;
 
 // Snapshot Service - for fast recovery
 let snapshotService = null;
+
+// Order Services - will be initialized on server start
+let orderServicesInstance = null;
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -56,10 +56,6 @@ app.get('/', async (req, res) => {
 
 // Mount route modules
 app.use('/api/orders', orderRoutes);
-app.use('/api/trades', tradesRoutes);
-app.use('/api/analytics', analyticsRoutes);
-app.use('/api/metrics', metricsRoutes);
-app.use('/', healthRoutes);
 
 // Server startup with Redis initialization
 async function startServer() {
@@ -91,6 +87,15 @@ async function startServer() {
         
         // Start periodic snapshots
         snapshotService.startPeriodicSnapshots();
+        
+        // Initialize Order Services (this loads data from MySQL/snapshots into Redis)
+        console.log('Initializing Order Services and Matching Engine...');
+        orderServicesInstance = new OrderServices(pool, redisService, snapshotService);
+        await orderServicesInstance.initialize();
+        console.log('✓ Order Services initialized - Redis order book loaded');
+        
+        // Store order services in app.locals for routes
+        app.locals.orderServices = orderServicesInstance;
         
         // Start server
         const port = process.env.PORT || 3000;

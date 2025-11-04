@@ -3,13 +3,15 @@ const OrderServices = require('../services/order.services');
 
 const router = express.Router();
 
-// Initialize order services once and reuse (will be moved to app.js)
-let orderServicesInstance = null;
-
 /**
- * Initialize order services helper
+ * Get order services helper
+ * Uses pre-initialized instance from server startup, or creates one if needed
  */
 async function getOrderServices(req) {
+    // Try to get pre-initialized instance from app.locals (created on server startup)
+    let orderServicesInstance = req.app.locals.orderServices;
+    
+    // Fallback: create new instance if not pre-initialized (for testing or edge cases)
     if (!orderServicesInstance) {
         const pool = req.app.locals.pool;
         const redisService = req.app.locals.redisService;
