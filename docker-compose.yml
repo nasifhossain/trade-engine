@@ -6,6 +6,10 @@ services:
     restart: always
     ports:
       - "${HOST_APP_PORT}:${PORT}"
+    # Mount the source so edits on host are visible inside container
+    volumes:
+      - ./:/app:cached
+      - /app/node_modules
     environment:
       - NODE_ENV=${NODE_ENV}
       - PORT=${PORT}
@@ -18,6 +22,7 @@ services:
     depends_on:
       - mysql
       - redis
+    command: ["npm", "run", "dev"]
     networks:
       - twocents-network
 
@@ -45,6 +50,37 @@ services:
       - "${HOST_REDIS_PORT}:6379"
     volumes:
       - redis-data:/data
+    networks:
+      - twocents-network
+
+  # phpMyAdmin for MySQL Visualization
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: twocents-phpmyadmin
+    restart: always
+    ports:
+      - "${HOST_PHPMYADMIN_PORT:-8081}:80"
+    environment:
+      - PMA_HOST=${MYSQL_HOST}
+      - PMA_PORT=3306
+      - PMA_USER=${MYSQL_USER}
+      - PMA_PASSWORD=${MYSQL_PASSWORD}
+    depends_on:
+      - mysql
+    networks:
+      - twocents-network
+
+  # Redis Commander for Redis Visualization
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: twocents-redis-commander
+    restart: always
+    ports:
+      - "${HOST_REDIS_COMMANDER_PORT:-8082}:8081"
+    environment:
+      - REDIS_HOSTS=local:${REDIS_HOST}:${REDIS_PORT}
+    depends_on:
+      - redis
     networks:
       - twocents-network
 
