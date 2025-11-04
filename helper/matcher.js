@@ -23,10 +23,33 @@ class MatchingEngine {
 
     /**
      * Initialize the matching engine by loading existing orders from DB to Redis
+     * Supports snapshot-based recovery for faster startup
+     * @param {Object} snapshotService - Optional snapshot service for fast recovery
      */
-    async initialize() {
+    async initialize(snapshotService = null) {
         try {
             console.log('🔄 Initializing matching engine with Redis...');
+            
+            // Try snapshot-based recovery if available
+            if (snapshotService && snapshotService.config.enabled) {
+                console.log('📸 Using snapshot-based recovery...');
+                const recoveryStats = await snapshotService.recoverAll();
+                
+                console.log('✅ Matching engine initialized successfully via snapshots');
+                
+                // Get book statistics from Redis
+                const stats = await this._getOrderBookStats();
+                console.log(`📊 Order book: ${stats.bidLevels} bid levels, ${stats.askLevels} ask levels`);
+                
+                if (stats.bestBid || stats.bestAsk) {
+                    console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
+                }
+                
+                return recoveryStats;
+            }
+            
+            // Fallback: Full replay from MySQL
+            console.log('📋 Using full replay recovery (no snapshots)...');
             
             // Load open orders from database
             const openOrdersQuery = await DB.find('orders', { status: 'open' });
@@ -49,7 +72,7 @@ class MatchingEngine {
                 }
             }
 
-            console.log('✅ Matching engine initialized successfully');
+            console.log('✅ Matching engine initialized successfully via full replay');
             
             // Get book statistics from Redis
             const stats = await this._getOrderBookStats();
@@ -58,6 +81,8 @@ class MatchingEngine {
             if (stats.bestBid || stats.bestAsk) {
                 console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
             }
+            
+            return { method: 'full_replay', totalOrders: openOrders.length };
             
         } catch (error) {
             console.error('❌ Error initializing matching engine:', error);
