@@ -50,25 +50,61 @@ class MatchingEngine {
             // Fallback: Full replay from MySQL
             console.log('📋 Using full replay recovery (no snapshots)...');
             
-            // Load open orders from database
-            const openOrdersQuery = await DB.find('orders', { status: 'open' });
-            const partialOrdersQuery = await DB.find('orders', { status: 'partially_filled' });
-            
-            const openOrders = [...openOrdersQuery, ...partialOrdersQuery];
+            // OPTIMIZATION: Single query with IN clause instead of two separate queries
+            const openOrders = await this.pool.query(
+                `SELECT * FROM orders WHERE status IN ('open', 'partially_filled') ORDER BY created_at ASC`
+            ).then(([rows]) => rows);
 
             console.log(`📋 Loading ${openOrders.length} open orders into Redis order book`);
 
-            // Batch load orders into Redis
+            // OPTIMIZATION: Batch load orders into Redis using pipeline
             let bidsLoaded = 0;
             let asksLoaded = 0;
             
-            for (const order of openOrders) {
-                await this._addOrderToRedis(order);
-                if (order.side === 'buy') {
-                    bidsLoaded++;
-                } else {
-                    asksLoaded++;
+            if (openOrders.length > 0) {
+                const pipeline = this.redisService.redis.pipeline();
+                
+                for (const order of openOrders) {
+                    // Skip completed orders
+                    if (order.status === 'filled' || order.status === 'cancelled') {
+                        continue;
+                    }
+
+                    const timestamp = order.created_at instanceof Date 
+                        ? order.created_at.getTime() 
+                        : new Date(order.created_at).getTime();
+
+                    const side = order.side === 'buy' ? 'buy' : 'sell';
+                    const bookKey = `orderbook:${order.instrument}:${side}`;
+                    const member = `${order.price}:${order.order_id}`;
+                    
+                    // Add to order book ZSET (score is timestamp for time priority)
+                    pipeline.zadd(bookKey, timestamp, member);
+                    
+                    // Cache order details for fast lookup
+                    pipeline.hset(`order:${order.order_id}`, {
+                        order_id: order.order_id,
+                        client_id: order.client_id,
+                        instrument: order.instrument,
+                        side: order.side,
+                        type: order.type,
+                        price: order.price.toString(),
+                        quantity: order.quantity.toString(),
+                        filled_quantity: order.filled_quantity.toString(),
+                        status: order.status,
+                        created_at: timestamp.toString()
+                    });
+                    
+                    if (order.side === 'buy') {
+                        bidsLoaded++;
+                    } else {
+                        asksLoaded++;
+                    }
                 }
+                
+                // Execute all Redis operations in a single batch
+                await pipeline.exec();
+                console.log(`✅ Batch loaded ${openOrders.length} orders to Redis using pipeline`);
             }
 
             console.log('✅ Matching engine initialized successfully via full replay');
