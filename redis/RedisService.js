@@ -606,6 +606,133 @@ class RedisService {
       timestamp: new Date()
     };
   }
+
+  // ==================== ADVANCED LOCKING OPERATIONS ====================
+
+  /**
+   * Acquire a distributed lock with automatic expiration
+   * @param {string} lockKey - The lock key
+   * @param {string} lockValue - Unique value to identify lock owner
+   * @param {number} ttlSeconds - Lock TTL in seconds
+   * @returns {Promise<boolean>} True if lock acquired
+   */
+  async acquireLock(lockKey, lockValue, ttlSeconds = 10) {
+    try {
+      const result = await this.redis.set(lockKey, lockValue, {
+        NX: true,
+        EX: ttlSeconds
+      });
+      return result === 'OK' || result === true;
+    } catch (error) {
+      console.error(`Error acquiring lock ${lockKey}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Release a lock only if we own it (using Lua script for atomicity)
+   * @param {string} lockKey - The lock key
+   * @param {string} lockValue - The value to verify ownership
+   * @returns {Promise<boolean>} True if lock was released
+   */
+  async releaseLock(lockKey, lockValue) {
+    try {
+      const script = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+          return redis.call("del", KEYS[1])
+        else
+          return 0
+        end
+      `;
+      
+      const result = await this.redis.eval(script, {
+        keys: [lockKey],
+        arguments: [lockValue]
+      });
+      
+      return result === 1;
+    } catch (error) {
+      console.error(`Error releasing lock ${lockKey}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Extend lock expiration if we own it
+   * @param {string} lockKey - The lock key
+   * @param {string} lockValue - The value to verify ownership
+   * @param {number} ttlSeconds - New TTL in seconds
+   * @returns {Promise<boolean>} True if lock was extended
+   */
+  async extendLock(lockKey, lockValue, ttlSeconds = 10) {
+    try {
+      const script = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+          return redis.call("expire", KEYS[1], ARGV[2])
+        else
+          return 0
+        end
+      `;
+      
+      const result = await this.redis.eval(script, {
+        keys: [lockKey],
+        arguments: [lockValue, ttlSeconds.toString()]
+      });
+      
+      return result === 1;
+    } catch (error) {
+      console.error(`Error extending lock ${lockKey}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Check if a lock exists and who owns it
+   * @param {string} lockKey - The lock key
+   * @returns {Promise<string|null>} Lock value if exists, null otherwise
+   */
+  async checkLock(lockKey) {
+    try {
+      return await this.redis.get(lockKey);
+    } catch (error) {
+      console.error(`Error checking lock ${lockKey}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get all active locks matching a pattern
+   * @param {string} pattern - Pattern to match (e.g., "matching:lock:*")
+   * @returns {Promise<Array>} Array of lock keys
+   */
+  async getActiveLocks(pattern = 'matching:lock:*') {
+    try {
+      const keys = await this.redis.keys(pattern);
+      return keys;
+    } catch (error) {
+      console.error(`Error getting active locks:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Force release all locks (use with caution!)
+   * @param {string} pattern - Pattern to match (e.g., "matching:lock:*")
+   * @returns {Promise<number>} Number of locks released
+   */
+  async forceReleaseAllLocks(pattern = 'matching:lock:*') {
+    try {
+      const keys = await this.redis.keys(pattern);
+      if (keys.length > 0) {
+        await this.redis.del(keys);
+        return keys.length;
+      }
+      return 0;
+    } catch (error) {
+      console.error(`Error releasing locks:`, error);
+      return 0;
+    }
+  }
 }
 
 module.exports = RedisService;

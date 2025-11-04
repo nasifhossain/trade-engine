@@ -14,10 +14,16 @@ class MatchingEngine {
         // Initialize DB with the pool
         DB.init(pool);
         
-        // Distributed lock configuration (per-instrument locking for better concurrency)
+        // Optimized lock configuration for low latency + high throughput
         this.lockTimeout = 5000; // 5 seconds
-        this.maxRetries = 50; // Balanced for throughput (fail faster to avoid request pileup)
-        this.retryDelay = 2; // milliseconds (reduced for higher throughput)
+        this.maxRetries = 200; // More retries but with minimal delay
+        this.baseRetryDelay = 1; // Start with 1ms (very aggressive)
+        this.maxRetryDelay = 20; // Cap at 20ms to keep latency low
+        this.backoffMultiplier = 1.2; // Gentle exponential growth
+        
+        // Per-instrument in-memory queues for serialization without Redis overhead
+        this.processingQueues = new Map();
+        this.queueLocks = new Map(); // In-memory locks per instrument
     }
 
     /**
@@ -126,83 +132,179 @@ class MatchingEngine {
     }
 
     /**
-     * Acquire distributed lock for specific instrument (per-instrument locking)
+     * Acquire distributed lock with optimized retry strategy for low latency
+     * Uses adaptive backoff that starts very aggressive then backs off gradually
      * @param {String} instrument - The trading instrument (e.g., 'BTC-USD')
-     * @returns {String} lockKey - The acquired lock key
+     * @returns {Object} {lockKey, lockValue} - The acquired lock info
      */
     async _acquireLock(instrument) {
         const lockKey = `matching:lock:${instrument}`;
+        const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         let retries = 0;
+        let delay = this.baseRetryDelay;
         
         while (retries < this.maxRetries) {
+            // Try to acquire lock (fast path - no try/catch overhead on success)
             const locked = await this.redisService.redis.set(
                 lockKey,
-                Date.now().toString(),
-                { EX: 5, NX: true }
+                lockValue,
+                { 
+                    EX: Math.floor(this.lockTimeout / 1000),
+                    NX: true
+                }
             );
             
             if (locked) {
-                return lockKey;
+                // Fast path: got lock immediately
+                if (retries > 0) {
+                    console.log(`🔒 Lock acquired for ${instrument} after ${retries} retries`);
+                }
+                return { lockKey, lockValue };
             }
             
-            await new Promise(resolve => setTimeout(resolve, this.retryDelay));
+            // Adaptive backoff with minimal jitter for low latency
+            // First 50 attempts: stay at base delay (1ms) for quick acquisition
+            // After 50: gradually increase to avoid spinning
+            if (retries < 50) {
+                delay = this.baseRetryDelay;
+            } else {
+                delay = Math.min(
+                    this.baseRetryDelay * Math.pow(this.backoffMultiplier, retries - 50),
+                    this.maxRetryDelay
+                );
+            }
+            
+            // Add tiny jitter (0-20% of delay) to prevent thundering herd
+            const jitter = Math.random() * delay * 0.2;
+            await new Promise(resolve => setTimeout(resolve, delay + jitter));
+            
             retries++;
         }
-        throw new Error(`Failed to acquire matching lock for ${instrument} - too many concurrent orders`);
+        
+        // Only log/throw after all retries exhausted
+        console.error(
+            `❌ Failed to acquire lock for ${instrument} after ${this.maxRetries} attempts. ` +
+            `High contention detected.`
+        );
+        throw new Error(
+            `Lock acquisition timeout for ${instrument}. Try again or check system load.`
+        );
     }
 
     /**
-     * Release distributed lock for specific instrument
+     * Release distributed lock (optimized with Lua script for atomicity)
      * @param {String} lockKey - The lock key to release
+     * @param {String} lockValue - The lock value to verify ownership
      */
-    async _releaseLock(lockKey) {
-        await this.redisService.redis.del(lockKey);
+    async _releaseLock(lockKey, lockValue) {
+        // Lua script ensures we only delete our own lock (atomic check-and-delete)
+        const script = `
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        `;
+        
+        try {
+            await this.redisService.redis.eval(script, {
+                keys: [lockKey],
+                arguments: [lockValue]
+            });
+        } catch (error) {
+            // Silent fail - lock will expire anyway
+            console.warn(`⚠️ Lock release warning for ${lockKey}:`, error.message);
+        }
     }
 
     /**
      * Process an incoming order and perform matching
-     * Acquires lock, matches, updates Redis, then persists to DB
+     * Uses hybrid locking: in-memory for single instance, Redis for distributed
      * @param {Object} order - The incoming order
      * @returns {Object} Match results with trades and updated order
      */
     async processOrder(order) {
-        // Acquire per-instrument lock for better concurrency
-        const lockKey = await this._acquireLock(order.instrument);
+        // OPTIMIZATION: Try in-memory lock first (zero latency for single instance)
+        const memoryLockAcquired = this._tryAcquireMemoryLock(order.instrument);
+        
+        if (memoryLockAcquired) {
+            // Fast path: got in-memory lock, no Redis overhead
+            try {
+                return await this._executeOrderProcessing(order);
+            } finally {
+                this._releaseMemoryLock(order.instrument);
+            }
+        }
+        
+        // Fallback: Use Redis distributed lock (for multi-instance or high contention)
+        const lock = await this._acquireLock(order.instrument);
+        const lockKey = lock.lockKey;
+        const lockValue = lock.lockValue;
 
         try {
-            const matchResult = {
-                trades: [],
-                orderUpdates: [],
-                bookUpdates: []
-            };
-
-            // Cache order in Redis for fast lookups
-            await this.redisService.storeOrderDetails(order.order_id, order);
-
-            if (order.type === 'market') {
-                await this._processMarketOrder(order, matchResult);
-            } else if (order.type === 'limit') {
-                await this._processLimitOrder(order, matchResult);
-            }
-
-            // Persist all changes to database and update Redis
-            await this._persistMatchResult(matchResult, order);
-            
-            // Log processing summary
-            if (matchResult.trades.length > 0) {
-                console.log(`💫 Order ${order.order_id} processing complete:`);
-                console.log(`   → ${matchResult.trades.length} trades executed`);
-                console.log(`   → ${matchResult.orderUpdates.length} orders updated`);
-                console.log(`   → Order status: ${order.status} (${order.filled_quantity}/${order.quantity} filled)`);
-            } else {
-                console.log(`📋 Order ${order.order_id} added to book (no immediate matches)`);
-            }
-
-            return matchResult;
-
+            return await this._executeOrderProcessing(order);
         } finally {
-            await this._releaseLock(lockKey);
+            await this._releaseLock(lockKey, lockValue);
+            this._releaseMemoryLock(order.instrument); // Clean up memory lock too
         }
+    }
+
+    /**
+     * Try to acquire in-memory lock (non-blocking, instant)
+     * @param {String} instrument - Trading instrument
+     * @returns {Boolean} True if lock acquired
+     */
+    _tryAcquireMemoryLock(instrument) {
+        if (!this.queueLocks.has(instrument)) {
+            this.queueLocks.set(instrument, false);
+        }
+        
+        const isLocked = this.queueLocks.get(instrument);
+        if (!isLocked) {
+            this.queueLocks.set(instrument, true);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Release in-memory lock
+     * @param {String} instrument - Trading instrument
+     */
+    _releaseMemoryLock(instrument) {
+        this.queueLocks.set(instrument, false);
+    }
+
+    /**
+     * Execute the actual order processing logic (separated for reuse)
+     * @param {Object} order - The incoming order
+     * @returns {Object} Match results
+     */
+    async _executeOrderProcessing(order) {
+        const matchResult = {
+            trades: [],
+            orderUpdates: [],
+            bookUpdates: []
+        };
+
+        // Cache order in Redis for fast lookups
+        await this.redisService.storeOrderDetails(order.order_id, order);
+
+        if (order.type === 'market') {
+            await this._processMarketOrder(order, matchResult);
+        } else if (order.type === 'limit') {
+            await this._processLimitOrder(order, matchResult);
+        }
+
+        // Persist all changes to database and update Redis
+        await this._persistMatchResult(matchResult, order);
+        
+        // Log processing summary (only for trades to reduce noise)
+        if (matchResult.trades.length > 0) {
+            console.log(`💫 Order ${order.order_id}: ${matchResult.trades.length} trades, status: ${order.status}`);
+        }
+
+        return matchResult;
     }
 
     /**
