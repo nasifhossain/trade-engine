@@ -1,11 +1,11 @@
 services:
-  # Node.js Application
+  # Node.js Application (Horizontally Scalable)
   app:
     build: .
-    container_name: twocents-app
+    # Removed container_name to allow scaling (--scale app=N)
     restart: always
-    ports:
-      - "${HOST_APP_PORT}:${PORT}"
+    expose:
+      - "${PORT}"  # Expose internally only, nginx will load balance
     environment:
       - NODE_ENV=${NODE_ENV}
       - PORT=${PORT}
@@ -45,6 +45,38 @@ services:
       - "${HOST_REDIS_PORT}:6379"
     volumes:
       - redis-data:/data
+    networks:
+      - twocents-network
+
+  # Redis Commander - Redis Visualization
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: twocents-redis-commander
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - twocents-network
+
+  # phpMyAdmin - MySQL Visualization
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: twocents-phpmyadmin
+    restart: always
+    ports:
+      - "8080:80"
+    environment:
+      - PMA_HOST=mysql
+      - PMA_PORT=3306
+      - PMA_USER=${MYSQL_USER}
+      - PMA_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    depends_on:
+      - mysql
     networks:
       - twocents-network
 
