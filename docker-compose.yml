@@ -1,8 +1,8 @@
 services:
-  # Node.js Application
+  # Node.js Application (Horizontally Scalable)
   app:
     build: .
-    container_name: twocents-app
+    # Removed container_name to allow scaling (--scale app=N)
     restart: always
     ports:
       - "${HOST_APP_PORT}:${PORT}"

@@ -8,9 +8,10 @@ const MatchingEngine = require('../helper/matcher');
  */
 
 class OrderServices {
-    constructor(pool, redisService) {
+    constructor(pool, redisService, snapshotService = null) {
         this.pool = pool;
         this.redisService = redisService;
+        this.snapshotService = snapshotService;
         
         // Initialize DB with the pool
         DB.init(pool);
@@ -21,10 +22,11 @@ class OrderServices {
 
     /**
      * Initialize the order services and matching engine
+     * Uses snapshot-based recovery if snapshot service is available
      */
     async initialize() {
         try {
-            await this.matchingEngine.initialize();
+            await this.matchingEngine.initialize(this.snapshotService);
             console.log('Order services initialized successfully');
         } catch (error) {
             console.error('Error initializing order services:', error);
@@ -226,7 +228,7 @@ class OrderServices {
      */
     async getOrderBook(instrument = 'BTC-USD', levels = 20) {
         try {
-            const orderBook = this.matchingEngine.getOrderBookDepth(instrument, levels);
+            const orderBook = await this.matchingEngine.getOrderBookDepth(instrument, levels);
             return {
                 success: true,
                 ...orderBook

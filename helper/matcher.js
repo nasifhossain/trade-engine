@@ -14,42 +14,106 @@ class MatchingEngine {
         // Initialize DB with the pool
         DB.init(pool);
         
-        // Distributed lock for thread safety (using Redis)
-        this.lockKey = 'matching:lock';
+        // Optimized lock configuration for low latency + high throughput
         this.lockTimeout = 5000; // 5 seconds
-        this.maxRetries = 10;
-        this.retryDelay = 10; // milliseconds
+        this.maxRetries = 200; // More retries but with minimal delay
+        this.baseRetryDelay = 1; // Start with 1ms (very aggressive)
+        this.maxRetryDelay = 20; // Cap at 20ms to keep latency low
+        this.backoffMultiplier = 1.2; // Gentle exponential growth
+        
+        // Per-instrument in-memory queues for serialization without Redis overhead
+        this.processingQueues = new Map();
+        this.queueLocks = new Map(); // In-memory locks per instrument
     }
 
     /**
      * Initialize the matching engine by loading existing orders from DB to Redis
+     * Supports snapshot-based recovery for faster startup
+     * @param {Object} snapshotService - Optional snapshot service for fast recovery
      */
-    async initialize() {
+    async initialize(snapshotService = null) {
         try {
             console.log('🔄 Initializing matching engine with Redis...');
             
-            // Load open orders from database
-            const openOrdersQuery = await DB.find('orders', { status: 'open' });
-            const partialOrdersQuery = await DB.find('orders', { status: 'partially_filled' });
+            // Try snapshot-based recovery if available
+            if (snapshotService && snapshotService.config.enabled) {
+                console.log('📸 Using snapshot-based recovery...');
+                const recoveryStats = await snapshotService.recoverAll();
+                
+                console.log('✅ Matching engine initialized successfully via snapshots');
+                
+                // Get book statistics from Redis
+                const stats = await this._getOrderBookStats();
+                console.log(`📊 Order book: ${stats.bidLevels} bid levels, ${stats.askLevels} ask levels`);
+                
+                if (stats.bestBid || stats.bestAsk) {
+                    console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
+                }
+                
+                return recoveryStats;
+            }
             
-            const openOrders = [...openOrdersQuery, ...partialOrdersQuery];
+            // Fallback: Full replay from MySQL
+            console.log('📋 Using full replay recovery (no snapshots)...');
+            
+            // OPTIMIZATION: Single query with IN clause instead of two separate queries
+            const openOrders = await this.pool.query(
+                `SELECT * FROM orders WHERE status IN ('open', 'partially_filled') ORDER BY created_at ASC`
+            ).then(([rows]) => rows);
 
             console.log(`📋 Loading ${openOrders.length} open orders into Redis order book`);
 
-            // Batch load orders into Redis
+            // OPTIMIZATION: Batch load orders into Redis using pipeline
             let bidsLoaded = 0;
             let asksLoaded = 0;
             
-            for (const order of openOrders) {
-                await this._addOrderToRedis(order);
-                if (order.side === 'buy') {
-                    bidsLoaded++;
-                } else {
-                    asksLoaded++;
+            if (openOrders.length > 0) {
+                const pipeline = this.redisService.redis.pipeline();
+                
+                for (const order of openOrders) {
+                    // Skip completed orders
+                    if (order.status === 'filled' || order.status === 'cancelled') {
+                        continue;
+                    }
+
+                    const timestamp = order.created_at instanceof Date 
+                        ? order.created_at.getTime() 
+                        : new Date(order.created_at).getTime();
+
+                    const side = order.side === 'buy' ? 'buy' : 'sell';
+                    const bookKey = `orderbook:${order.instrument}:${side}`;
+                    const member = `${order.price}:${order.order_id}`;
+                    
+                    // Add to order book ZSET (score is timestamp for time priority)
+                    pipeline.zadd(bookKey, timestamp, member);
+                    
+                    // Cache order details for fast lookup
+                    pipeline.hset(`order:${order.order_id}`, {
+                        order_id: order.order_id,
+                        client_id: order.client_id,
+                        instrument: order.instrument,
+                        side: order.side,
+                        type: order.type,
+                        price: order.price.toString(),
+                        quantity: order.quantity.toString(),
+                        filled_quantity: order.filled_quantity.toString(),
+                        status: order.status,
+                        created_at: timestamp.toString()
+                    });
+                    
+                    if (order.side === 'buy') {
+                        bidsLoaded++;
+                    } else {
+                        asksLoaded++;
+                    }
                 }
+                
+                // Execute all Redis operations in a single batch
+                await pipeline.exec();
+                console.log(`✅ Batch loaded ${openOrders.length} orders to Redis using pipeline`);
             }
 
-            console.log('✅ Matching engine initialized successfully');
+            console.log('✅ Matching engine initialized successfully via full replay');
             
             // Get book statistics from Redis for default instrument
             const stats = await this._getOrderBookStats('BTC-USD');
@@ -59,6 +123,8 @@ class MatchingEngine {
                 console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
             }
             
+            return { method: 'full_replay', totalOrders: openOrders.length };
+            
         } catch (error) {
             console.error('❌ Error initializing matching engine:', error);
             throw error;
@@ -66,77 +132,179 @@ class MatchingEngine {
     }
 
     /**
-     * Acquire distributed lock for matching operations
+     * Acquire distributed lock with optimized retry strategy for low latency
+     * Uses adaptive backoff that starts very aggressive then backs off gradually
+     * @param {String} instrument - The trading instrument (e.g., 'BTC-USD')
+     * @returns {Object} {lockKey, lockValue} - The acquired lock info
      */
-    async _acquireLock() {
+    async _acquireLock(instrument) {
+        const lockKey = `matching:lock:${instrument}`;
+        const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         let retries = 0;
+        let delay = this.baseRetryDelay;
+        
         while (retries < this.maxRetries) {
+            // Try to acquire lock (fast path - no try/catch overhead on success)
             const locked = await this.redisService.redis.set(
-                this.lockKey,
-                Date.now().toString(),
-                { EX: 5, NX: true }
+                lockKey,
+                lockValue,
+                { 
+                    EX: Math.floor(this.lockTimeout / 1000),
+                    NX: true
+                }
             );
             
             if (locked) {
-                return true;
+                // Fast path: got lock immediately
+                if (retries > 0) {
+                    console.log(`🔒 Lock acquired for ${instrument} after ${retries} retries`);
+                }
+                return { lockKey, lockValue };
             }
             
-            await new Promise(resolve => setTimeout(resolve, this.retryDelay));
+            // Adaptive backoff with minimal jitter for low latency
+            // First 50 attempts: stay at base delay (1ms) for quick acquisition
+            // After 50: gradually increase to avoid spinning
+            if (retries < 50) {
+                delay = this.baseRetryDelay;
+            } else {
+                delay = Math.min(
+                    this.baseRetryDelay * Math.pow(this.backoffMultiplier, retries - 50),
+                    this.maxRetryDelay
+                );
+            }
+            
+            // Add tiny jitter (0-20% of delay) to prevent thundering herd
+            const jitter = Math.random() * delay * 0.2;
+            await new Promise(resolve => setTimeout(resolve, delay + jitter));
+            
             retries++;
         }
-        throw new Error('Failed to acquire matching lock - engine busy');
+        
+        // Only log/throw after all retries exhausted
+        console.error(
+            `❌ Failed to acquire lock for ${instrument} after ${this.maxRetries} attempts. ` +
+            `High contention detected.`
+        );
+        throw new Error(
+            `Lock acquisition timeout for ${instrument}. Try again or check system load.`
+        );
     }
 
     /**
-     * Release distributed lock
+     * Release distributed lock (optimized with Lua script for atomicity)
+     * @param {String} lockKey - The lock key to release
+     * @param {String} lockValue - The lock value to verify ownership
      */
-    async _releaseLock() {
-        await this.redisService.redis.del(this.lockKey);
+    async _releaseLock(lockKey, lockValue) {
+        // Lua script ensures we only delete our own lock (atomic check-and-delete)
+        const script = `
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        `;
+        
+        try {
+            await this.redisService.redis.eval(script, {
+                keys: [lockKey],
+                arguments: [lockValue]
+            });
+        } catch (error) {
+            // Silent fail - lock will expire anyway
+            console.warn(`⚠️ Lock release warning for ${lockKey}:`, error.message);
+        }
     }
 
     /**
      * Process an incoming order and perform matching
-     * Acquires lock, matches, updates Redis, then persists to DB
+     * Uses hybrid locking: in-memory for single instance, Redis for distributed
      * @param {Object} order - The incoming order
      * @returns {Object} Match results with trades and updated order
      */
     async processOrder(order) {
-        await this._acquireLock();
+        // OPTIMIZATION: Try in-memory lock first (zero latency for single instance)
+        const memoryLockAcquired = this._tryAcquireMemoryLock(order.instrument);
+        
+        if (memoryLockAcquired) {
+            // Fast path: got in-memory lock, no Redis overhead
+            try {
+                return await this._executeOrderProcessing(order);
+            } finally {
+                this._releaseMemoryLock(order.instrument);
+            }
+        }
+        
+        // Fallback: Use Redis distributed lock (for multi-instance or high contention)
+        const lock = await this._acquireLock(order.instrument);
+        const lockKey = lock.lockKey;
+        const lockValue = lock.lockValue;
 
         try {
-            const matchResult = {
-                trades: [],
-                orderUpdates: [],
-                bookUpdates: []
-            };
-
-            // Cache order in Redis for fast lookups
-            await this.redisService.storeOrderDetails(order.order_id, order);
-
-            if (order.type === 'market') {
-                await this._processMarketOrder(order, matchResult);
-            } else if (order.type === 'limit') {
-                await this._processLimitOrder(order, matchResult);
-            }
-
-            // Persist all changes to database and update Redis
-            await this._persistMatchResult(matchResult, order);
-            
-            // Log processing summary
-            if (matchResult.trades.length > 0) {
-                console.log(`💫 Order ${order.order_id} processing complete:`);
-                console.log(`   → ${matchResult.trades.length} trades executed`);
-                console.log(`   → ${matchResult.orderUpdates.length} orders updated`);
-                console.log(`   → Order status: ${order.status} (${order.filled_quantity}/${order.quantity} filled)`);
-            } else {
-                console.log(`📋 Order ${order.order_id} added to book (no immediate matches)`);
-            }
-
-            return matchResult;
-
+            return await this._executeOrderProcessing(order);
         } finally {
-            await this._releaseLock();
+            await this._releaseLock(lockKey, lockValue);
+            this._releaseMemoryLock(order.instrument); // Clean up memory lock too
         }
+    }
+
+    /**
+     * Try to acquire in-memory lock (non-blocking, instant)
+     * @param {String} instrument - Trading instrument
+     * @returns {Boolean} True if lock acquired
+     */
+    _tryAcquireMemoryLock(instrument) {
+        if (!this.queueLocks.has(instrument)) {
+            this.queueLocks.set(instrument, false);
+        }
+        
+        const isLocked = this.queueLocks.get(instrument);
+        if (!isLocked) {
+            this.queueLocks.set(instrument, true);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Release in-memory lock
+     * @param {String} instrument - Trading instrument
+     */
+    _releaseMemoryLock(instrument) {
+        this.queueLocks.set(instrument, false);
+    }
+
+    /**
+     * Execute the actual order processing logic (separated for reuse)
+     * @param {Object} order - The incoming order
+     * @returns {Object} Match results
+     */
+    async _executeOrderProcessing(order) {
+        const matchResult = {
+            trades: [],
+            orderUpdates: [],
+            bookUpdates: []
+        };
+
+        // Cache order in Redis for fast lookups
+        await this.redisService.storeOrderDetails(order.order_id, order);
+
+        if (order.type === 'market') {
+            await this._processMarketOrder(order, matchResult);
+        } else if (order.type === 'limit') {
+            await this._processLimitOrder(order, matchResult);
+        }
+
+        // Persist all changes to database and update Redis
+        await this._persistMatchResult(matchResult, order);
+        
+        // Log processing summary (only for trades to reduce noise)
+        if (matchResult.trades.length > 0) {
+            console.log(`💫 Order ${order.order_id}: ${matchResult.trades.length} trades, status: ${order.status}`);
+        }
+
+        return matchResult;
     }
 
     /**

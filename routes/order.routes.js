@@ -3,22 +3,25 @@ const OrderServices = require('../services/order.services');
 
 const router = express.Router();
 
-// Initialize order services once and reuse (will be moved to app.js)
-let orderServicesInstance = null;
-
 /**
- * Initialize order services helper
+ * Get order services helper
+ * Uses pre-initialized instance from server startup, or creates one if needed
  */
 async function getOrderServices(req) {
+    // Try to get pre-initialized instance from app.locals (created on server startup)
+    let orderServicesInstance = req.app.locals.orderServices;
+    
+    // Fallback: create new instance if not pre-initialized (for testing or edge cases)
     if (!orderServicesInstance) {
         const pool = req.app.locals.pool;
         const redisService = req.app.locals.redisService;
+        const snapshotService = req.app.locals.snapshotService;
 
         if (!pool || !redisService) {
             throw new Error('Database or Redis service not available');
         }
 
-        orderServicesInstance = new OrderServices(pool, redisService);
+        orderServicesInstance = new OrderServices(pool, redisService, snapshotService);
         await orderServicesInstance.initialize();
     }
     return orderServicesInstance;
@@ -65,11 +68,11 @@ router.post('/orders', async (req, res) => {
 
     } catch (error) {
         console.error('Error in /orders endpoint:', error);
-        
+
         // Handle validation errors vs server errors
         const statusCode = error.message.includes('Missing required fields') ||
-                          error.message.includes('must be') ||
-                          error.message.includes('Invalid') ? 400 : 500;
+            error.message.includes('must be') ||
+            error.message.includes('Invalid') ? 400 : 500;
 
         res.status(statusCode).json({
             success: false,
@@ -85,7 +88,7 @@ router.post('/orders', async (req, res) => {
 router.post('/orders/:order_id/cancel', async (req, res) => {
     try {
         const { order_id } = req.params;
-        
+
         if (!order_id) {
             return res.status(400).json({
                 success: false,
@@ -100,9 +103,9 @@ router.post('/orders/:order_id/cancel', async (req, res) => {
 
     } catch (error) {
         console.error('Error in /orders/:order_id/cancel endpoint:', error);
-        
+
         const statusCode = error.message.includes('not found') ? 404 : 500;
-        
+
         res.status(statusCode).json({
             success: false,
             error: error.message
@@ -117,7 +120,7 @@ router.post('/orders/:order_id/cancel', async (req, res) => {
 router.get('/orders/:order_id', async (req, res) => {
     try {
         const { order_id } = req.params;
-        
+
         if (!order_id) {
             return res.status(400).json({
                 success: false,
@@ -132,9 +135,9 @@ router.get('/orders/:order_id', async (req, res) => {
 
     } catch (error) {
         console.error('Error in /orders/:order_id endpoint:', error);
-        
+
         const statusCode = error.message.includes('not found') ? 404 : 500;
-        
+
         res.status(statusCode).json({
             success: false,
             error: error.message
@@ -152,19 +155,19 @@ router.get('/orders/:order_id', async (req, res) => {
  */
 router.get('/orderbook', async (req, res) => {
     try {
-        const { 
-            instrument = 'BTC-USD', 
-            levels = 20 
+        const {
+            instrument = 'BTC-USD',
+            levels = 20
         } = req.query;
 
         const orderServices = await getOrderServices(req);
         const result = await orderServices.getOrderBook(instrument, parseInt(levels));
-
+        console.log(result);
         res.status(200).json(result);
 
     } catch (error) {
         console.error('Error in /orderbook endpoint:', error);
-        
+
         res.status(500).json({
             success: false,
             error: error.message
@@ -200,7 +203,7 @@ router.get('/trades', async (req, res) => {
 
     } catch (error) {
         console.error('Error in /trades endpoint:', error);
-        
+
         res.status(500).json({
             success: false,
             error: error.message
@@ -258,11 +261,11 @@ router.post('/sell', async (req, res) => {
 
     } catch (error) {
         console.error('Error in /sell endpoint:', error);
-        
+
         // Handle validation errors vs server errors
         const statusCode = error.message.includes('Missing required fields') ||
-                          error.message.includes('must be') ||
-                          error.message.includes('Invalid') ? 400 : 500;
+            error.message.includes('must be') ||
+            error.message.includes('Invalid') ? 400 : 500;
 
         res.status(statusCode).json({
             success: false,
@@ -321,7 +324,7 @@ router.get('/sell', async (req, res) => {
 
     } catch (error) {
         console.error('Error in GET /sell endpoint:', error);
-        
+
         res.status(500).json({
             success: false,
             error: error.message
@@ -379,11 +382,11 @@ router.post('/buy', async (req, res) => {
 
     } catch (error) {
         console.error('Error in /buy endpoint:', error);
-        
+
         // Handle validation errors vs server errors
         const statusCode = error.message.includes('Missing required fields') ||
-                          error.message.includes('must be') ||
-                          error.message.includes('Invalid') ? 400 : 500;
+            error.message.includes('must be') ||
+            error.message.includes('Invalid') ? 400 : 500;
 
         res.status(statusCode).json({
             success: false,
@@ -442,7 +445,7 @@ router.get('/buy', async (req, res) => {
 
     } catch (error) {
         console.error('Error in GET /buy endpoint:', error);
-        
+
         res.status(500).json({
             success: false,
             error: error.message
@@ -506,7 +509,7 @@ router.get('/all', async (req, res) => {
 
     } catch (error) {
         console.error('Error in GET /all endpoint:', error);
-        
+
         res.status(500).json({
             success: false,
             error: error.message
