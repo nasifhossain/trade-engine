@@ -1,5 +1,4 @@
 const { randomUUID } = require('crypto');
-const { DB, QueryBuilder } = require('../db/query');
 const MatchingEngine = require('../helper/matcher');
 
 /**
@@ -8,16 +7,13 @@ const MatchingEngine = require('../helper/matcher');
  */
 
 class OrderServices {
-    constructor(pool, redisService, snapshotService = null) {
-        this.pool = pool;
+    constructor(prisma, redisService, snapshotService = null) {
+        this.prisma = prisma;
         this.redisService = redisService;
         this.snapshotService = snapshotService;
         
-        // Initialize DB with the pool
-        DB.init(pool);
-        
         // Initialize matching engine
-        this.matchingEngine = new MatchingEngine(pool, redisService);
+        this.matchingEngine = new MatchingEngine(prisma, redisService);
     }
 
     /**
@@ -57,8 +53,8 @@ class OrderServices {
                 }
 
                 // 2. Check SQL database (durable, survives Redis restart)
-                const sqlCached = await DB.find_one('idempotency_keys', { 
-                    idempotency_key: idempotencyKey 
+                const sqlCached = await this.prisma.idempotencyKey.findUnique({ 
+                    where: { idempotency_key: idempotencyKey } 
                 });
                 
                 if (sqlCached) {
@@ -110,12 +106,14 @@ class OrderServices {
                     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
                     
                     try {
-                        await DB.insert('idempotency_keys', {
-                            idempotency_key: idempotencyKey,
-                            order_id: order_id,
-                            response_data: JSON.stringify(result),
-                            http_status: 201,
-                            expires_at: expiresAt
+                        await this.prisma.idempotencyKey.create({
+                            data: {
+                                idempotency_key: idempotencyKey,
+                                order_id: order_id,
+                                response_data: result,
+                                http_status: 201,
+                                expires_at: expiresAt
+                            }
                         });
                         console.log(`✅ Idempotency stored in SQL: ${idempotencyKey} -> ${order_id}`);
                     } catch (sqlError) {
@@ -194,7 +192,7 @@ class OrderServices {
             }
 
             // Get from database
-            const order = await DB.find_one('orders', { order_id: orderId });
+            const order = await this.prisma.order.findUnique({ where: { order_id: orderId } });
             if (!order) {
                 throw new Error('Order not found');
             }
@@ -270,24 +268,20 @@ class OrderServices {
             }
 
             // Build query
-            let query = new QueryBuilder(this.pool).table('trades').select('*');
-
+            const where = {};
             if (instrument) {
-                query = query.where('instrument', instrument);
+                where.instrument = instrument;
             }
 
-            query = query.order_by('executed_at', 'DESC').limit(limit, offset);
-
-            const trades = await query.get();
+            const trades = await this.prisma.trade.findMany({
+                where,
+                orderBy: { executed_at: 'desc' },
+                take: limit,
+                skip: offset
+            });
 
             // Get total count
-            let countQuery = new QueryBuilder(this.pool).table('trades').select('COUNT(*) as total');
-            if (instrument) {
-                countQuery = countQuery.where('instrument', instrument);
-            }
-
-            const countResult = await countQuery.get();
-            const total = countResult[0]?.total || 0;
+            const total = await this.prisma.trade.count({ where });
 
             const result = {
                 trades,
@@ -376,21 +370,13 @@ class OrderServices {
                 status
             };
 
-            // Insert order into database using query builder
-            const insertResult = await DB.insert('orders', orderToInsert);
+            // Insert order into database using Prisma
+            const createdOrder = await this.prisma.order.create({
+                data: orderToInsert
+            });
 
-            if (!insertResult.success) {
-                throw new Error('Failed to insert order into database');
-            }
-
-            // Construct the created order response (no extra DB fetch for performance)
-            // Timestamps will be within milliseconds of actual DB values
-            const now = new Date();
-            const createdOrder = {
-                ...orderToInsert,
-                created_at: now,
-                updated_at: now
-            };
+            // Timestamps will be handled by Prisma, use Date object for redis timestamp
+            const now = createdOrder.created_at;
 
             // Cache the order in Redis using the dedicated method
             await this.redisService.storeOrderDetails(order_id, createdOrder);
@@ -490,43 +476,22 @@ class OrderServices {
                 console.warn('Redis cache error:', cacheError);
             }
 
-            // Start building the query using QueryBuilder instance
-            let query = new QueryBuilder(this.pool).table('orders').select('*').where('side', 'sell');
-
             // Apply filters
-            if (client_id) {
-                query = query.where('client_id', client_id);
-            }
-
-            if (instrument) {
-                query = query.where('instrument', instrument);
-            }
-
-            if (status) {
-                query = query.where('status', status);
-            }
-
-            // Add ordering and pagination
-            query = query.order_by('created_at', 'DESC').limit(limit, offset);
+            const where = { side: 'sell' };
+            if (client_id) where.client_id = client_id;
+            if (instrument) where.instrument = instrument;
+            if (status) where.status = status;
 
             // Execute query
-            const orders = await query.get();
+            const orders = await this.prisma.order.findMany({
+                where,
+                orderBy: { created_at: 'desc' },
+                take: limit,
+                skip: offset
+            });
 
             // Get total count for pagination (without limit/offset)
-            let countQuery = new QueryBuilder(this.pool).table('orders').select('COUNT(*) as total').where('side', 'sell');
-            
-            if (client_id) {
-                countQuery = countQuery.where('client_id', client_id);
-            }
-            if (instrument) {
-                countQuery = countQuery.where('instrument', instrument);
-            }
-            if (status) {
-                countQuery = countQuery.where('status', status);
-            }
-
-            const countResult = await countQuery.get();
-            const total = countResult[0]?.total || 0;
+            const total = await this.prisma.order.count({ where });
 
             const result = {
                 orders,
@@ -628,21 +593,13 @@ class OrderServices {
                 status
             };
 
-            // Insert order into database using query builder
-            const insertResult = await DB.insert('orders', orderToInsert);
+            // Insert order into database using Prisma
+            const createdOrder = await this.prisma.order.create({
+                data: orderToInsert
+            });
 
-            if (!insertResult.success) {
-                throw new Error('Failed to insert order into database');
-            }
-
-            // Construct the created order response (no extra DB fetch for performance)
-            // Timestamps will be within milliseconds of actual DB values
-            const now = new Date();
-            const createdOrder = {
-                ...orderToInsert,
-                created_at: now,
-                updated_at: now
-            };
+            // Timestamps will be handled by Prisma, use Date object for redis timestamp
+            const now = createdOrder.created_at;
 
             // Cache the order in Redis using the dedicated method
             await this.redisService.storeOrderDetails(order_id, createdOrder);
@@ -742,43 +699,22 @@ class OrderServices {
                 console.warn('Redis cache error:', cacheError);
             }
 
-            // Start building the query using QueryBuilder instance
-            let query = new QueryBuilder(this.pool).table('orders').select('*').where('side', 'buy');
-
             // Apply filters
-            if (client_id) {
-                query = query.where('client_id', client_id);
-            }
-
-            if (instrument) {
-                query = query.where('instrument', instrument);
-            }
-
-            if (status) {
-                query = query.where('status', status);
-            }
-
-            // Add ordering and pagination
-            query = query.order_by('created_at', 'DESC').limit(limit, offset);
+            const where = { side: 'buy' };
+            if (client_id) where.client_id = client_id;
+            if (instrument) where.instrument = instrument;
+            if (status) where.status = status;
 
             // Execute query
-            const orders = await query.get();
+            const orders = await this.prisma.order.findMany({
+                where,
+                orderBy: { created_at: 'desc' },
+                take: limit,
+                skip: offset
+            });
 
             // Get total count for pagination (without limit/offset)
-            let countQuery = new QueryBuilder(this.pool).table('orders').select('COUNT(*) as total').where('side', 'buy');
-            
-            if (client_id) {
-                countQuery = countQuery.where('client_id', client_id);
-            }
-            if (instrument) {
-                countQuery = countQuery.where('instrument', instrument);
-            }
-            if (status) {
-                countQuery = countQuery.where('status', status);
-            }
-
-            const countResult = await countQuery.get();
-            const total = countResult[0]?.total || 0;
+            const total = await this.prisma.order.count({ where });
 
             const result = {
                 orders,
@@ -852,57 +788,24 @@ class OrderServices {
                 console.warn('Redis cache error:', cacheError);
             }
 
-            // Start building the query using QueryBuilder instance
-            let query = new QueryBuilder(this.pool).table('orders').select('*');
-
             // Apply filters
-            if (client_id) {
-                query = query.where('client_id', client_id);
-            }
-
-            if (instrument) {
-                query = query.where('instrument', instrument);
-            }
-
-            if (side) {
-                query = query.where('side', side);
-            }
-
-            if (status) {
-                query = query.where('status', status);
-            }
-
-            if (type) {
-                query = query.where('type', type);
-            }
-
-            // Add ordering and pagination
-            query = query.order_by('created_at', 'DESC').limit(limit, offset);
+            const where = {};
+            if (client_id) where.client_id = client_id;
+            if (instrument) where.instrument = instrument;
+            if (side) where.side = side;
+            if (status) where.status = status;
+            if (type) where.type = type;
 
             // Execute query
-            const orders = await query.get();
+            const orders = await this.prisma.order.findMany({
+                where,
+                orderBy: { created_at: 'desc' },
+                take: limit,
+                skip: offset
+            });
 
             // Get total count for pagination (without limit/offset)
-            let countQuery = new QueryBuilder(this.pool).table('orders').select('COUNT(*) as total');
-            
-            if (client_id) {
-                countQuery = countQuery.where('client_id', client_id);
-            }
-            if (instrument) {
-                countQuery = countQuery.where('instrument', instrument);
-            }
-            if (side) {
-                countQuery = countQuery.where('side', side);
-            }
-            if (status) {
-                countQuery = countQuery.where('status', status);
-            }
-            if (type) {
-                countQuery = countQuery.where('type', type);
-            }
-
-            const countResult = await countQuery.get();
-            const total = countResult[0]?.total || 0;
+            const total = await this.prisma.order.count({ where });
 
             const result = {
                 orders,

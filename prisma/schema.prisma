@@ -1,0 +1,105 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Order {
+  order_id         String            @id @default(uuid()) @db.VarChar(36)
+  client_id        String            @db.VarChar(50)
+  instrument       String            @db.VarChar(20)
+  side             OrderSide
+  type             OrderType
+  price            Decimal?          @db.Decimal(20, 8)
+  quantity         Decimal           @db.Decimal(20, 8)
+  filled_quantity  Decimal           @default(0.0) @db.Decimal(20, 8)
+  status           OrderStatus       @default(open)
+  created_at       DateTime          @default(now()) @db.Timestamp(6)
+  updated_at       DateTime          @updatedAt @db.Timestamp(6)
+
+  // Relations
+  trades_as_buy    Trade[]           @relation("BuyOrderTrades")
+  trades_as_sell   Trade[]           @relation("SellOrderTrades")
+  idempotency_keys IdempotencyKey[]
+
+  @@index([client_id])
+  @@index([instrument])
+  @@index([status])
+  @@index([created_at])
+  @@map("orders")
+}
+
+model Trade {
+  trade_id        String   @id @default(uuid()) @db.VarChar(36)
+  buy_order_id    String   @db.VarChar(36)
+  sell_order_id   String   @db.VarChar(36)
+  instrument      String   @db.VarChar(20)
+  price           Decimal  @db.Decimal(20, 8)
+  quantity        Decimal  @db.Decimal(20, 8)
+  buy_client_id   String   @db.VarChar(50)
+  sell_client_id  String   @db.VarChar(50)
+  executed_at     DateTime @default(now()) @db.Timestamp(6)
+
+  buy_order       Order    @relation("BuyOrderTrades", fields: [buy_order_id], references: [order_id], onDelete: Restrict, onUpdate: Cascade)
+  sell_order      Order    @relation("SellOrderTrades", fields: [sell_order_id], references: [order_id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([buy_order_id])
+  @@index([sell_order_id])
+  @@index([instrument])
+  @@index([executed_at])
+  @@map("trades")
+}
+
+model IdempotencyKey {
+  idempotency_key String    @id @db.VarChar(255)
+  order_id        String    @db.VarChar(36)
+  response_data   Json?
+  http_status     Int       @default(200)
+  created_at      DateTime  @default(now()) @db.Timestamp(6)
+  expires_at      DateTime? @db.Timestamp(6)
+
+  order           Order     @relation(fields: [order_id], references: [order_id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([order_id])
+  @@index([expires_at])
+  @@map("idempotency_keys")
+}
+
+model OrderBookSnapshot {
+  snapshot_id   BigInt    @id @default(autoincrement())
+  instrument    String    @db.VarChar(20)
+  snapshot_data Json
+  order_count   Int       @default(0)
+  snapshot_type SnapshotType @default(scheduled)
+  snapshot_at   DateTime  @default(now()) @db.Timestamp(6)
+
+  @@index([instrument])
+  @@index([snapshot_at])
+  @@map("order_book_snapshots")
+}
+
+enum OrderSide {
+  buy
+  sell
+}
+
+enum OrderType {
+  market
+  limit
+}
+
+enum OrderStatus {
+  open
+  partially_filled
+  filled
+  cancelled
+  rejected
+}
+
+enum SnapshotType {
+  scheduled
+  manual
+  shutdown
+}

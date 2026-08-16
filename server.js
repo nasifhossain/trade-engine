@@ -1,5 +1,7 @@
 const express = require('express');
-const { DBForge } = require('./db');
+const { PrismaClient } = require('@prisma/client');
+const { PrismaPg } = require('@prisma/adapter-pg');
+const { Pool } = require('pg');
 const { createRedisService } = require('./redis');
 const SnapshotService = require('./services/snapshot.services');
 const OrderServices = require('./services/order.services');
@@ -10,8 +12,11 @@ const orderRoutes = require('./routes/order.routes');
 const app = express();
 app.use(express.json());
 
-// MySQL Connection Pool - using DBForge
-const pool = DBForge.createPoolFromEnv();
+// Prisma Client with Driver Adapter
+const connectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@postgres:5432/trade_engine';
+const pgPool = new Pool({ connectionString });
+const adapter = new PrismaPg(pgPool);
+const prisma = new PrismaClient({ adapter });
 
 // Redis Service - will be initialized on server start
 let redisService = null;
@@ -35,8 +40,8 @@ app.get('/', async (req, res) => {
         await redisService.redis.set(testKey, 'Hello from Redis!');
         const redisValue = await redisService.redis.get(testKey);
         
-        // Test MySQL
-        const [rows] = await pool.query('SELECT 1 + 1 AS result');
+        // Test DB
+        const rows = await prisma.$queryRaw`SELECT 1 + 1 AS result`;
         
         // Test Redis health
         const redisHealth = await redisService.healthCheck();
@@ -44,7 +49,7 @@ app.get('/', async (req, res) => {
         res.json({
             message: "Get request received",
             redis: redisValue,
-            mysql: rows[0].result,
+            database: rows[0].result,
             redis_healthy: redisHealth.healthy,
             status: "All services connected successfully"
         });
@@ -67,7 +72,7 @@ async function startServer() {
         
         // Initialize Snapshot Service
         console.log('Initializing Snapshot Service...');
-        snapshotService = new SnapshotService(pool, redisService);
+        snapshotService = new SnapshotService(prisma, redisService);
         
         // Configure snapshot service (customize based on environment)
         snapshotService.configure({
@@ -82,15 +87,15 @@ async function startServer() {
         
         // Store in app.locals for use in routes
         app.locals.redisService = redisService;
-        app.locals.pool = pool;
+        app.locals.prisma = prisma;
         app.locals.snapshotService = snapshotService;
         
         // Start periodic snapshots
         snapshotService.startPeriodicSnapshots();
         
-        // Initialize Order Services (this loads data from MySQL/snapshots into Redis)
+        // Initialize Order Services (this loads data from DB/snapshots into Redis)
         console.log('Initializing Order Services and Matching Engine...');
-        orderServicesInstance = new OrderServices(pool, redisService, snapshotService);
+        orderServicesInstance = new OrderServices(prisma, redisService, snapshotService);
         await orderServicesInstance.initialize();
         console.log('✓ Order Services initialized - Redis order book loaded');
         
@@ -101,7 +106,7 @@ async function startServer() {
         const port = process.env.PORT || 3000;
         app.listen(port, () => {
             console.log(`✓ Server is running on port ${port}`);
-            console.log(`✓ MySQL Host: ${process.env.MYSQL_HOST || 'localhost'}`);
+            console.log(`✓ Database Host: ${process.env.DATABASE_URL ? 'Configured' : 'Missing'}`);
             console.log(`✓ Redis Host: ${process.env.REDIS_HOST || 'localhost'}`);
             console.log(`✓ All services initialized successfully!`);
         });
@@ -130,9 +135,9 @@ async function gracefulShutdown(signal) {
             await closeRedisClient(redisService.redis);
         }
         
-        // Close MySQL pool
-        console.log('Closing MySQL pool...');
-        await pool.end();
+        // Disconnect Prisma
+        console.log('Disconnecting from database...');
+        await prisma.$disconnect();
         
         console.log('✓ Graceful shutdown complete');
         process.exit(0);

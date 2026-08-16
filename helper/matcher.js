@@ -1,5 +1,4 @@
 const { randomUUID } = require('crypto');
-const { DB } = require('../db/query');
 
 /**
  * Trading Matching Engine - Redis Optimized
@@ -7,20 +6,17 @@ const { DB } = require('../db/query');
  * Uses Redis for scalable order book management and caching
  */
 class MatchingEngine {
-    constructor(pool, redisService) {
-        this.pool = pool;
+    constructor(prisma, redisService) {
+        this.prisma = prisma;
         this.redisService = redisService;
-        
-        // Initialize DB with the pool
-        DB.init(pool);
-        
+
         // Optimized lock configuration for low latency + high throughput
-        this.lockTimeout = 5000; // 5 seconds
-        this.maxRetries = 200; // More retries but with minimal delay
+        this.lockTimeout = 2500; // 5 seconds
+        this.maxRetries = 250; // More retries but with minimal delay
         this.baseRetryDelay = 1; // Start with 1ms (very aggressive)
         this.maxRetryDelay = 20; // Cap at 20ms to keep latency low
         this.backoffMultiplier = 1.2; // Gentle exponential growth
-        
+
         // Per-instrument in-memory queues for serialization without Redis overhead
         this.processingQueues = new Map();
         this.queueLocks = new Map(); // In-memory locks per instrument
@@ -34,59 +30,60 @@ class MatchingEngine {
     async initialize(snapshotService = null) {
         try {
             console.log('🔄 Initializing matching engine with Redis...');
-            
+
             // Try snapshot-based recovery if available
             if (snapshotService && snapshotService.config.enabled) {
                 console.log('📸 Using snapshot-based recovery...');
                 const recoveryStats = await snapshotService.recoverAll();
-                
+
                 console.log('✅ Matching engine initialized successfully via snapshots');
-                
+
                 // Get book statistics from Redis
                 const stats = await this._getOrderBookStats();
                 console.log(`📊 Order book: ${stats.bidLevels} bid levels, ${stats.askLevels} ask levels`);
-                
+
                 if (stats.bestBid || stats.bestAsk) {
                     console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
                 }
-                
+
                 return recoveryStats;
             }
-            
+
             // Fallback: Full replay from MySQL
             console.log('📋 Using full replay recovery (no snapshots)...');
-            
+
             // OPTIMIZATION: Single query with IN clause instead of two separate queries
-            const openOrders = await this.pool.query(
-                `SELECT * FROM orders WHERE status IN ('open', 'partially_filled') ORDER BY created_at ASC`
-            ).then(([rows]) => rows);
+            const openOrders = await this.prisma.order.findMany({
+                where: { status: { in: ['open', 'partially_filled'] } },
+                orderBy: { created_at: 'asc' }
+            });
 
             console.log(`📋 Loading ${openOrders.length} open orders into Redis order book`);
 
             // OPTIMIZATION: Batch load orders into Redis using pipeline
             let bidsLoaded = 0;
             let asksLoaded = 0;
-            
+
             if (openOrders.length > 0) {
                 const pipeline = this.redisService.redis.pipeline();
-                
+
                 for (const order of openOrders) {
                     // Skip completed orders
                     if (order.status === 'filled' || order.status === 'cancelled') {
                         continue;
                     }
 
-                    const timestamp = order.created_at instanceof Date 
-                        ? order.created_at.getTime() 
+                    const timestamp = order.created_at instanceof Date
+                        ? order.created_at.getTime()
                         : new Date(order.created_at).getTime();
 
                     const side = order.side === 'buy' ? 'buy' : 'sell';
                     const bookKey = `orderbook:${order.instrument}:${side}`;
                     const member = `${order.price}:${order.order_id}`;
-                    
+
                     // Add to order book ZSET (score is timestamp for time priority)
                     pipeline.zadd(bookKey, timestamp, member);
-                    
+
                     // Cache order details for fast lookup
                     pipeline.hset(`order:${order.order_id}`, {
                         order_id: order.order_id,
@@ -100,31 +97,31 @@ class MatchingEngine {
                         status: order.status,
                         created_at: timestamp.toString()
                     });
-                    
+
                     if (order.side === 'buy') {
                         bidsLoaded++;
                     } else {
                         asksLoaded++;
                     }
                 }
-                
+
                 // Execute all Redis operations in a single batch
                 await pipeline.exec();
                 console.log(`✅ Batch loaded ${openOrders.length} orders to Redis using pipeline`);
             }
 
             console.log('✅ Matching engine initialized successfully via full replay');
-            
+
             // Get book statistics from Redis for default instrument
             const stats = await this._getOrderBookStats('BTC-USD');
             console.log(`📊 Order book (BTC-USD): ${stats.bidLevels} bid levels (${bidsLoaded} orders), ${stats.askLevels} ask levels (${asksLoaded} orders)`);
-            
+
             if (stats.bestBid || stats.bestAsk) {
                 console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
             }
-            
+
             return { method: 'full_replay', totalOrders: openOrders.length };
-            
+
         } catch (error) {
             console.error('❌ Error initializing matching engine:', error);
             throw error;
@@ -142,18 +139,18 @@ class MatchingEngine {
         const lockValue = `${process.pid}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         let retries = 0;
         let delay = this.baseRetryDelay;
-        
+
         while (retries < this.maxRetries) {
             // Try to acquire lock (fast path - no try/catch overhead on success)
             const locked = await this.redisService.redis.set(
                 lockKey,
                 lockValue,
-                { 
+                {
                     EX: Math.floor(this.lockTimeout / 1000),
                     NX: true
                 }
             );
-            
+
             if (locked) {
                 // Fast path: got lock immediately
                 if (retries > 0) {
@@ -161,7 +158,7 @@ class MatchingEngine {
                 }
                 return { lockKey, lockValue };
             }
-            
+
             // Adaptive backoff with minimal jitter for low latency
             // First 50 attempts: stay at base delay (1ms) for quick acquisition
             // After 50: gradually increase to avoid spinning
@@ -173,14 +170,14 @@ class MatchingEngine {
                     this.maxRetryDelay
                 );
             }
-            
+
             // Add tiny jitter (0-20% of delay) to prevent thundering herd
             const jitter = Math.random() * delay * 0.2;
             await new Promise(resolve => setTimeout(resolve, delay + jitter));
-            
+
             retries++;
         }
-        
+
         // Only log/throw after all retries exhausted
         console.error(
             `❌ Failed to acquire lock for ${instrument} after ${this.maxRetries} attempts. ` +
@@ -205,7 +202,7 @@ class MatchingEngine {
                 return 0
             end
         `;
-        
+
         try {
             await this.redisService.redis.eval(script, {
                 keys: [lockKey],
@@ -226,7 +223,7 @@ class MatchingEngine {
     async processOrder(order) {
         // OPTIMIZATION: Try in-memory lock first (zero latency for single instance)
         const memoryLockAcquired = this._tryAcquireMemoryLock(order.instrument);
-        
+
         if (memoryLockAcquired) {
             // Fast path: got in-memory lock, no Redis overhead
             try {
@@ -235,7 +232,7 @@ class MatchingEngine {
                 this._releaseMemoryLock(order.instrument);
             }
         }
-        
+
         // Fallback: Use Redis distributed lock (for multi-instance or high contention)
         const lock = await this._acquireLock(order.instrument);
         const lockKey = lock.lockKey;
@@ -258,7 +255,7 @@ class MatchingEngine {
         if (!this.queueLocks.has(instrument)) {
             this.queueLocks.set(instrument, false);
         }
-        
+
         const isLocked = this.queueLocks.get(instrument);
         if (!isLocked) {
             this.queueLocks.set(instrument, true);
@@ -298,7 +295,7 @@ class MatchingEngine {
 
         // Persist all changes to database and update Redis
         await this._persistMatchResult(matchResult, order);
-        
+
         // Log processing summary (only for trades to reduce noise)
         if (matchResult.trades.length > 0) {
             console.log(`💫 Order ${order.order_id}: ${matchResult.trades.length} trades, status: ${order.status}`);
@@ -312,7 +309,7 @@ class MatchingEngine {
      * Uses Redis to fetch orders efficiently
      */
     async _processMarketOrder(order, matchResult) {
-        const oppositeBooks = order.side === 'buy' 
+        const oppositeBooks = order.side === 'buy'
             ? { key: `orderbook:${order.instrument}:sell`, side: 'sell' }
             : { key: `orderbook:${order.instrument}:buy`, side: 'buy' };
 
@@ -340,13 +337,13 @@ class MatchingEngine {
                 // Create and track trade
                 const trade = this._createTrade(order, makerOrder, oppositeOrderRef.price, matchQuantity);
                 matchResult.trades.push(trade);
-                
+
                 console.log(`🔄 Market order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
                 console.log(`   → Taker: ${order.order_id} (${order.client_id})`);
                 console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id})`);
 
                 // Update quantities
-                order.filled_quantity += matchQuantity;
+                order.filled_quantity = parseFloat(order.filled_quantity) + matchQuantity;
                 makerOrder.filled_quantity = (parseFloat(makerOrder.filled_quantity) + matchQuantity).toString();
                 remainingQuantity -= matchQuantity;
 
@@ -354,8 +351,8 @@ class MatchingEngine {
                 this._updateOrderStatus(order);
                 this._updateOrderStatus(makerOrder);
 
-                matchResult.orderUpdates.push({...order});
-                matchResult.orderUpdates.push({...makerOrder});
+                matchResult.orderUpdates.push({ ...order });
+                matchResult.orderUpdates.push({ ...makerOrder });
 
                 // Update Redis if maker is fully filled
                 if (parseFloat(makerOrder.filled_quantity) >= parseFloat(makerOrder.quantity)) {
@@ -387,7 +384,7 @@ class MatchingEngine {
             : await this.redisService.getTopOrders(order.instrument, 'buy', 1000);
 
         // Filter orders that match our limit price
-        const matchableOrders = oppositeOrders.filter(o => 
+        const matchableOrders = oppositeOrders.filter(o =>
             order.side === 'buy' ? o.price <= order.price : o.price >= order.price
         );
 
@@ -408,13 +405,13 @@ class MatchingEngine {
                 // Trade at maker's price (price improvement for taker)
                 const trade = this._createTrade(order, makerOrder, oppositeOrderRef.price, matchQuantity);
                 matchResult.trades.push(trade);
-                
+
                 console.log(`🔄 Limit order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
                 console.log(`   → Taker: ${order.order_id} (${order.client_id}) - limit ${order.price}`);
                 console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id}) - got ${oppositeOrderRef.price}`);
 
                 // Update quantities
-                order.filled_quantity += matchQuantity;
+                order.filled_quantity = parseFloat(order.filled_quantity) + matchQuantity;
                 makerOrder.filled_quantity = (parseFloat(makerOrder.filled_quantity) + matchQuantity).toString();
                 remainingQuantity -= matchQuantity;
 
@@ -422,8 +419,8 @@ class MatchingEngine {
                 this._updateOrderStatus(order);
                 this._updateOrderStatus(makerOrder);
 
-                matchResult.orderUpdates.push({...order});
-                matchResult.orderUpdates.push({...makerOrder});
+                matchResult.orderUpdates.push({ ...order });
+                matchResult.orderUpdates.push({ ...makerOrder });
 
                 // Remove fully filled maker order from Redis
                 if (parseFloat(makerOrder.filled_quantity) >= parseFloat(makerOrder.quantity)) {
@@ -460,8 +457,8 @@ class MatchingEngine {
             return; // Don't add completed orders
         }
 
-        const timestamp = order.created_at instanceof Date 
-            ? order.created_at.getTime() 
+        const timestamp = order.created_at instanceof Date
+            ? order.created_at.getTime()
             : new Date(order.created_at).getTime();
 
         await this.redisService.addOrderToBook(
@@ -492,7 +489,7 @@ class MatchingEngine {
             // Note: executed_at will be set by database default (CURRENT_TIMESTAMP)
             // But we can also set it explicitly if needed
             executed_at: new Date(),
-            
+
             // Additional metadata for internal use (not stored in DB)
             taker_order_id: takerOrder.order_id,
             maker_order_id: makerOrder.order_id,
@@ -504,9 +501,12 @@ class MatchingEngine {
      * Update order status based on filled quantity
      */
     _updateOrderStatus(order) {
-        if (order.filled_quantity >= order.quantity) {
+        const filled = parseFloat(order.filled_quantity);
+        const total = parseFloat(order.quantity);
+
+        if (filled >= total) {
             order.status = 'filled';
-        } else if (order.filled_quantity > 0) {
+        } else if (filled > 0) {
             order.status = 'partially_filled';
         }
         order.updated_at = new Date();
@@ -533,35 +533,27 @@ class MatchingEngine {
                 };
 
                 console.log(`Inserting trade: ${trade.trade_id} - ${trade.quantity} ${trade.instrument} @ ${trade.price}`);
-                
-                const insertResult = await DB.insert('trades', tradeData);
-                
-                if (!insertResult.success) {
-                    throw new Error(`Failed to insert trade ${trade.trade_id}`);
-                }
+
+                await this.prisma.trade.create({ data: tradeData });
 
                 // Add to recent trades in Redis for fast access
                 await this.redisService.addRecentTrade(trade.instrument, trade);
-                
+
                 console.log(`✓ Trade ${trade.trade_id} persisted`);
             }
 
             // Update orders in database and Redis cache
             for (const updatedOrder of matchResult.orderUpdates) {
                 console.log(`Updating order: ${updatedOrder.order_id} - filled: ${updatedOrder.filled_quantity}/${updatedOrder.quantity}, status: ${updatedOrder.status}`);
-                
-                const updateResult = await DB.update('orders', 
-                    {
-                        filled_quantity: parseFloat(updatedOrder.filled_quantity).toFixed(8),
+
+                const updateResult = await this.prisma.order.update({
+                    where: { order_id: updatedOrder.order_id },
+                    data: {
+                        filled_quantity: parseFloat(updatedOrder.filled_quantity),
                         status: updatedOrder.status,
                         updated_at: updatedOrder.updated_at
-                    },
-                    { order_id: updatedOrder.order_id }
-                );
-
-                if (!updateResult.success) {
-                    throw new Error(`Failed to update order ${updatedOrder.order_id}`);
-                }
+                    }
+                });
 
                 // Update Redis cache
                 await this.redisService.updateOrderStatus(
@@ -594,10 +586,10 @@ class MatchingEngine {
         try {
             // Try Redis cache first for faster lookup
             let order = await this.redisService.getOrderDetails(orderId);
-            
+
             // If not in Redis, fetch from database
             if (!order) {
-                const dbResult = await DB.find_one('orders', { order_id: orderId });
+                const dbResult = await this.prisma.order.findUnique({ where: { order_id: orderId } });
                 order = dbResult;
                 if (!order) {
                     throw new Error('Order not found');
@@ -609,8 +601,8 @@ class MatchingEngine {
             }
 
             // Remove from Redis order book
-            const timestamp = order.created_at instanceof Date 
-                ? order.created_at.getTime() 
+            const timestamp = order.created_at instanceof Date
+                ? order.created_at.getTime()
                 : new Date(order.created_at).getTime();
 
             await this.redisService.removeOrderFromBook(
@@ -621,13 +613,13 @@ class MatchingEngine {
             );
 
             // Update status in database
-            await DB.update('orders', 
-                {
+            await this.prisma.order.update({
+                where: { order_id: orderId },
+                data: {
                     status: 'cancelled',
                     updated_at: new Date()
-                },
-                { order_id: orderId }
-            );
+                }
+            });
 
             // Update Redis cache
             await this.redisService.updateOrderStatus(orderId, 'cancelled', order.filled_quantity);
@@ -654,7 +646,7 @@ class MatchingEngine {
     async getOrderBook(instrument, levels = 20) {
         try {
             const orderBook = await this.redisService.getOrderBook(instrument, levels);
-            
+
             return {
                 instrument,
                 bids: orderBook.bids.map(bid => ({
@@ -667,8 +659,8 @@ class MatchingEngine {
                     quantity: this._calculateLevelQuantity(ask),
                     orders: 1
                 })),
-                spread: orderBook.asks.length > 0 && orderBook.bids.length > 0 
-                    ? parseFloat((orderBook.asks[0].price - orderBook.bids[0].price).toFixed(8)) 
+                spread: orderBook.asks.length > 0 && orderBook.bids.length > 0
+                    ? parseFloat((orderBook.asks[0].price - orderBook.bids[0].price).toFixed(8))
                     : null,
                 timestamp: new Date()
             };
@@ -684,7 +676,7 @@ class MatchingEngine {
     async getOrderBookDepth(instrument, levels = 20) {
         try {
             const orderBook = await this.getOrderBook(instrument, levels);
-            
+
             // Add cumulative quantities
             let bidCumulative = 0;
             orderBook.bids = orderBook.bids.map(level => {
