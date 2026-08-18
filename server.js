@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const { createRedisService } = require('./redis');
 const SnapshotService = require('./services/snapshot.services');
 const OrderServices = require('./services/order.services');
+const BinanceService = require('./services/binance.services');
 
 // Import route modules
 const orderRoutes = require('./routes/order.routes');
@@ -26,6 +27,9 @@ let snapshotService = null;
 
 // Order Services - will be initialized on server start
 let orderServicesInstance = null;
+
+// Binance Ingestion Service
+let binanceService = null;
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -102,6 +106,12 @@ async function startServer() {
         // Store order services in app.locals for routes
         app.locals.orderServices = orderServicesInstance;
         
+        // Initialize Binance Ingestion Service (Phase 2 & 3)
+        console.log('Initializing Binance Ingestion Service...');
+        binanceService = new BinanceService(orderServicesInstance);
+        binanceService.start();
+        app.locals.binanceService = binanceService;
+        
         // Start server
         const port = process.env.PORT || 3000;
         app.listen(port, () => {
@@ -126,6 +136,10 @@ async function gracefulShutdown(signal) {
             console.log('Creating shutdown snapshots...');
             await snapshotService.createShutdownSnapshots();
             snapshotService.stopPeriodicSnapshots();
+        }
+        
+        if (binanceService) {
+            binanceService.stop();
         }
         
         // Close Redis connection
