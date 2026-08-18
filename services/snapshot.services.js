@@ -1,29 +1,8 @@
-const { DB } = require('../db/query');
-
-/**
- * Snapshot Service for Order Book Recovery
- * 
- * Strategy: Periodically snapshot Redis orderbook to MySQL
- * On restart: Load latest snapshot + replay orders created after snapshot
- * 
- * Trade-offs:
- * - Fast recovery: ~2-5 seconds even with 100K orders (vs 30-60s full replay)
- * - Storage overhead: ~200 bytes per order (~12MB for 60K orders)
- * - Eventual consistency: Small replay window (typically <5 min of orders)
- * 
- * Recovery Time Comparison:
- * - 1K orders:   Full replay 0.5s  | Snapshot 0.3s
- * - 10K orders:  Full replay 5s    | Snapshot 1.5s
- * - 60K orders:  Full replay 30s   | Snapshot 3s
- * - 100K orders: Full replay 50s   | Snapshot 4s
- */
+// Prisma replaced DB
 class SnapshotService {
-    constructor(pool, redisService) {
-        this.pool = pool;
+    constructor(prisma, redisService) {
+        this.prisma = prisma;
         this.redisService = redisService;
-        
-        // Initialize DB
-        DB.init(pool);
         
         // Configuration
         this.config = {
@@ -181,12 +160,14 @@ class SnapshotService {
             };
             
             // Insert snapshot into database
-            await DB.insert('order_book_snapshots', {
-                instrument,
-                snapshot_data: JSON.stringify(snapshotData),
-                order_count: orderCount,
-                snapshot_type: 'scheduled',
-                snapshot_at
+            await this.prisma.orderBookSnapshot.create({
+                data: {
+                    instrument,
+                    snapshot_data: snapshotData,
+                    order_count: orderCount,
+                    snapshot_type: 'scheduled',
+                    snapshot_at
+                }
             });
             
             const duration = Date.now() - startTime;
@@ -248,20 +229,19 @@ class SnapshotService {
         
         try {
             // Find latest snapshot
-            const snapshots = await DB.raw(`
-                SELECT * FROM order_book_snapshots
-                WHERE instrument = ?
-                ORDER BY snapshot_at DESC
-                LIMIT 1
-            `, [instrument]);
+            const snapshot = await this.prisma.orderBookSnapshot.findFirst({
+                where: { instrument },
+                orderBy: { snapshot_at: 'desc' }
+            });
             
-            if (!snapshots || snapshots.length === 0) {
+            if (!snapshot) {
                 console.log(`⚠️  No snapshot found for ${instrument}, performing full replay`);
                 return await this.fullReplayRecovery(instrument);
             }
             
-            const snapshot = snapshots[0];
-            const snapshotData = JSON.parse(snapshot.snapshot_data);
+            const snapshotData = typeof snapshot.snapshot_data === 'string' 
+                ? JSON.parse(snapshot.snapshot_data) 
+                : snapshot.snapshot_data;
             const { bids, asks, snapshot_at } = snapshotData;
             
             console.log(`📸 Loading snapshot for ${instrument} from ${snapshot_at}`);
@@ -299,13 +279,14 @@ class SnapshotService {
             }
             
             // Replay orders created AFTER snapshot
-            const newOrders = await DB.raw(`
-                SELECT * FROM orders
-                WHERE instrument = ?
-                  AND status IN ('open', 'partially_filled')
-                  AND created_at > ?
-                ORDER BY created_at ASC
-            `, [instrument, snapshot_at]);
+            const newOrders = await this.prisma.order.findMany({
+                where: {
+                    instrument,
+                    status: { in: ['open', 'partially_filled'] },
+                    created_at: { gt: new Date(snapshot_at) }
+                },
+                orderBy: { created_at: 'asc' }
+            });
             
             console.log(`   → Replaying: ${newOrders.length} orders created after snapshot`);
             
@@ -356,12 +337,13 @@ class SnapshotService {
         
         try {
             // Query all open orders from MySQL
-            const orders = await DB.raw(`
-                SELECT * FROM orders
-                WHERE instrument = ?
-                  AND status IN ('open', 'partially_filled')
-                ORDER BY created_at ASC
-            `, [instrument]);
+            const orders = await this.prisma.order.findMany({
+                where: {
+                    instrument,
+                    status: { in: ['open', 'partially_filled'] }
+                },
+                orderBy: { created_at: 'asc' }
+            });
             
             console.log(`📋 Full replay for ${instrument}: ${orders.length} orders`);
             
@@ -440,25 +422,30 @@ class SnapshotService {
     async cleanupOldSnapshots(instrument) {
         try {
             // Delete old snapshots, keep only the most recent N
-            const deleted = await DB.raw(`
-                DELETE FROM order_book_snapshots
-                WHERE instrument = ? 
-                AND snapshot_id NOT IN (
-                    SELECT snapshot_id FROM (
-                        SELECT snapshot_id 
-                        FROM order_book_snapshots
-                        WHERE instrument = ?
-                        ORDER BY snapshot_at DESC
-                        LIMIT ?
-                    ) AS keep_snapshots
-                )
-            `, [instrument, instrument, this.config.retentionCount]);
+            const keepSnapshots = await this.prisma.orderBookSnapshot.findMany({
+                where: { instrument },
+                orderBy: { snapshot_at: 'desc' },
+                take: this.config.retentionCount,
+                select: { snapshot_id: true }
+            });
             
-            if (deleted.affectedRows > 0) {
-                console.log(`🗑️  Cleaned up ${deleted.affectedRows} old snapshots for ${instrument}`);
+            const keepIds = keepSnapshots.map(s => s.snapshot_id);
+            
+            let deleted = { count: 0 };
+            if (keepIds.length > 0) {
+                deleted = await this.prisma.orderBookSnapshot.deleteMany({
+                    where: {
+                        instrument,
+                        snapshot_id: { notIn: keepIds }
+                    }
+                });
             }
             
-            return deleted.affectedRows;
+            if (deleted.count > 0) {
+                console.log(`🗑️  Cleaned up ${deleted.count} old snapshots for ${instrument}`);
+            }
+            
+            return deleted.count;
         } catch (error) {
             console.warn(`Cleanup failed for ${instrument}:`, error.message);
             return 0;
@@ -499,12 +486,14 @@ class SnapshotService {
                     }
                 };
                 
-                await DB.insert('order_book_snapshots', {
-                    instrument,
-                    snapshot_data: JSON.stringify(snapshotData),
-                    order_count: orderCount,
-                    snapshot_type: 'shutdown',
-                    snapshot_at
+                await this.prisma.orderBookSnapshot.create({
+                    data: {
+                        instrument,
+                        snapshot_data: snapshotData,
+                        order_count: orderCount,
+                        snapshot_type: 'shutdown',
+                        snapshot_at
+                    }
                 });
                 
                 console.log(`✅ Shutdown snapshot for ${instrument}: ${orderCount} orders`);
@@ -524,17 +513,19 @@ class SnapshotService {
      */
     async getSnapshotStats() {
         try {
-            const stats = await DB.raw(`
-                SELECT 
-                    instrument,
-                    COUNT(*) as snapshot_count,
-                    MAX(snapshot_at) as latest_snapshot,
-                    SUM(order_count) as total_orders_snapshoted
-                FROM order_book_snapshots
-                GROUP BY instrument
-            `);
+            const statsRaw = await this.prisma.orderBookSnapshot.groupBy({
+                by: ['instrument'],
+                _count: { snapshot_id: true },
+                _max: { snapshot_at: true },
+                _sum: { order_count: true }
+            });
             
-            return stats;
+            return statsRaw.map(s => ({
+                instrument: s.instrument,
+                snapshot_count: s._count.snapshot_id,
+                latest_snapshot: s._max.snapshot_at,
+                total_orders_snapshoted: s._sum.order_count || 0
+            }));
         } catch (error) {
             console.error('Failed to get snapshot stats:', error);
             return [];

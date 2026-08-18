@@ -4,15 +4,25 @@
  * This file contains:
  * 1. Functional tests (matching logic, price-time priority, partial fills)
  * 2. Simple load tests (performance testing)
+ * 3. Precise 2000 RPS load test with detailed metrics
  * 
  * Usage:
  *   npm install axios (if not installed)
- *   node test-matching-engine.js [functional|load|all]
+ *   node test-matching-engine.js [mode] [duration]
+ * 
+ * Modes:
+ *   functional  - Run only functional tests
+ *   load        - Run only basic load tests
+ *   precise     - Run precise 2000 RPS test with detailed metrics
+ *   all         - Run functional and basic load tests
  * 
  * Examples:
- *   node test-matching-engine.js                    # Run all tests
+ *   node test-matching-engine.js                    # Run all tests (functional + load)
  *   node test-matching-engine.js functional         # Run only functional tests
  *   node test-matching-engine.js load              # Run only load tests
+ *   node test-matching-engine.js precise            # Run precise 2000 RPS test (60 sec default)
+ *   node test-matching-engine.js precise 30         # Run precise 2000 RPS test for 30 seconds
+ *   node test-matching-engine.js precise 120        # Run precise 2000 RPS test for 2 minutes
  */
 
 const axios = require('axios');
@@ -639,6 +649,337 @@ async function runLoadTest() {
     };
 }
 
+/**
+ * Force Exactly 2000 req/sec Load Test with Detailed Metrics
+ * 
+ * This function enforces a strict 2000 requests/second rate by:
+ * - Using precise timing control
+ * - Batching requests in controlled intervals
+ * - Collecting comprehensive metrics per second
+ * - Providing real-time monitoring
+ */
+async function runPrecise2000RpsLoadTest(durationSeconds = 60) {
+    log('\n' + '='.repeat(80), 'info');
+    log('PRECISE 2000 RPS LOAD TEST - Detailed Metrics Collection', 'info');
+    log('='.repeat(80), 'info');
+    
+    const TARGET_RPS = 2000;
+    const BATCH_INTERVAL_MS = 100; // Send requests every 100ms
+    const REQUESTS_PER_BATCH = (TARGET_RPS * BATCH_INTERVAL_MS) / 1000; // 200 requests per batch
+    
+    log(`\n🎯 Target: ${TARGET_RPS} requests/second (STRICT)`, 'info');
+    log(`📦 Strategy: ${REQUESTS_PER_BATCH} requests every ${BATCH_INTERVAL_MS}ms`, 'info');
+    log(`⏱️  Duration: ${durationSeconds} seconds\n`, 'info');
+    
+    const startTime = Date.now();
+    const endTime = startTime + (durationSeconds * 1000);
+    
+    // Global metrics
+    const globalMetrics = {
+        totalRequests: 0,
+        totalSuccess: 0,
+        totalFailed: 0,
+        allLatencies: [],
+        errors: {}
+    };
+    
+    // Per-second metrics
+    const perSecondMetrics = [];
+    let currentSecondMetrics = {
+        second: 0,
+        requests: 0,
+        success: 0,
+        failed: 0,
+        latencies: [],
+        rps: 0
+    };
+    
+    let batchCounter = 0;
+    let lastSecond = 0;
+    
+    // Real-time monitoring
+    const monitorInterval = setInterval(() => {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const progress = Math.min((elapsed / durationSeconds) * 100, 100);
+        const bar = '█'.repeat(Math.floor(progress / 2.5)) + '░'.repeat(40 - Math.floor(progress / 2.5));
+        const currentRps = currentSecondMetrics.requests > 0 ? 
+            (currentSecondMetrics.requests / (elapsed % 1 || 1)).toFixed(0) : '0';
+        
+        process.stdout.write(
+            `\r[${bar}] ${progress.toFixed(1)}% | ` +
+            `Sec: ${Math.floor(elapsed)}/${durationSeconds} | ` +
+            `Total: ${globalMetrics.totalRequests} | ` +
+            `RPS: ~${currentRps} | ` +
+            `Success: ${globalMetrics.totalSuccess} | ` +
+            `Failed: ${globalMetrics.totalFailed}`
+        );
+    }, 250);
+    
+    // Main load generation loop
+    while (Date.now() < endTime) {
+        const batchStartTime = Date.now();
+        const currentElapsed = batchStartTime - startTime;
+        const currentSecond = Math.floor(currentElapsed / 1000);
+        
+        // New second started - save previous metrics
+        if (currentSecond > lastSecond && currentSecondMetrics.requests > 0) {
+            currentSecondMetrics.rps = currentSecondMetrics.requests;
+            perSecondMetrics.push({ ...currentSecondMetrics });
+            
+            // Reset for new second
+            currentSecondMetrics = {
+                second: currentSecond,
+                requests: 0,
+                success: 0,
+                failed: 0,
+                latencies: [],
+                rps: 0
+            };
+            lastSecond = currentSecond;
+        } else if (currentSecond === 0 && lastSecond === 0) {
+            currentSecondMetrics.second = 0;
+        }
+        
+        // Send batch of requests
+        const batchPromises = [];
+        for (let i = 0; i < REQUESTS_PER_BATCH; i++) {
+            const promise = createLoadTestOrder().then(result => {
+                // Update global metrics
+                globalMetrics.totalRequests++;
+                if (result.success) {
+                    globalMetrics.totalSuccess++;
+                } else {
+                    globalMetrics.totalFailed++;
+                    const errorKey = result.error || `HTTP_${result.statusCode}`;
+                    globalMetrics.errors[errorKey] = (globalMetrics.errors[errorKey] || 0) + 1;
+                }
+                globalMetrics.allLatencies.push(result.latency);
+                
+                // Update current second metrics
+                currentSecondMetrics.requests++;
+                if (result.success) {
+                    currentSecondMetrics.success++;
+                } else {
+                    currentSecondMetrics.failed++;
+                }
+                currentSecondMetrics.latencies.push(result.latency);
+                
+                return result;
+            });
+            
+            batchPromises.push(promise);
+        }
+        
+        // Wait for batch to complete or timeout
+        await Promise.allSettled(batchPromises);
+        batchCounter++;
+        
+        // Precise timing control - wait until next batch time
+        const batchElapsed = Date.now() - batchStartTime;
+        const sleepTime = Math.max(0, BATCH_INTERVAL_MS - batchElapsed);
+        
+        if (sleepTime > 0) {
+            await new Promise(resolve => setTimeout(resolve, sleepTime));
+        }
+    }
+    
+    // Save last second's metrics
+    if (currentSecondMetrics.requests > 0) {
+        currentSecondMetrics.rps = currentSecondMetrics.requests;
+        perSecondMetrics.push(currentSecondMetrics);
+    }
+    
+    clearInterval(monitorInterval);
+    console.log('\n'); // New line after progress
+    
+    // Calculate comprehensive statistics
+    const totalDuration = (Date.now() - startTime) / 1000;
+    const actualRPS = globalMetrics.totalRequests / totalDuration;
+    const successRate = (globalMetrics.totalSuccess / globalMetrics.totalRequests) * 100;
+    
+    // Latency statistics
+    globalMetrics.allLatencies.sort((a, b) => a - b);
+    const latencyStats = {
+        min: globalMetrics.allLatencies[0],
+        max: globalMetrics.allLatencies[globalMetrics.allLatencies.length - 1],
+        avg: globalMetrics.allLatencies.reduce((a, b) => a + b, 0) / globalMetrics.allLatencies.length,
+        p50: globalMetrics.allLatencies[Math.floor(globalMetrics.allLatencies.length * 0.50)],
+        p75: globalMetrics.allLatencies[Math.floor(globalMetrics.allLatencies.length * 0.75)],
+        p90: globalMetrics.allLatencies[Math.floor(globalMetrics.allLatencies.length * 0.90)],
+        p95: globalMetrics.allLatencies[Math.floor(globalMetrics.allLatencies.length * 0.95)],
+        p99: globalMetrics.allLatencies[Math.floor(globalMetrics.allLatencies.length * 0.99)],
+        p999: globalMetrics.allLatencies[Math.floor(globalMetrics.allLatencies.length * 0.999)]
+    };
+    
+    // RPS statistics across all seconds
+    const rpsValues = perSecondMetrics.map(m => m.rps);
+    const rpsStats = {
+        min: Math.min(...rpsValues),
+        max: Math.max(...rpsValues),
+        avg: rpsValues.reduce((a, b) => a + b, 0) / rpsValues.length,
+        stdDev: 0
+    };
+    const rpsVariance = rpsValues.reduce((sum, rps) => sum + Math.pow(rps - rpsStats.avg, 2), 0) / rpsValues.length;
+    rpsStats.stdDev = Math.sqrt(rpsVariance);
+    
+    // Print detailed results
+    log('='.repeat(80), 'info');
+    log('PRECISE 2000 RPS LOAD TEST RESULTS', 'info');
+    log('='.repeat(80) + '\n', 'info');
+    
+    // Overall Metrics
+    log('📊 OVERALL METRICS:', 'info');
+    log('─'.repeat(80), 'info');
+    log(`   Total Duration:        ${totalDuration.toFixed(2)}s`, 'info');
+    log(`   Total Requests:        ${globalMetrics.totalRequests.toLocaleString()}`, 'info');
+    log(`   Successful:            ${globalMetrics.totalSuccess.toLocaleString()} (${successRate.toFixed(2)}%)`, 
+        successRate >= 95 ? 'success' : 'warn');
+    log(`   Failed:                ${globalMetrics.totalFailed.toLocaleString()} (${(100-successRate).toFixed(2)}%)`, 
+        globalMetrics.totalFailed === 0 ? 'success' : 'error');
+    log(`   Target RPS:            ${TARGET_RPS}`, 'info');
+    log(`   Actual RPS:            ${actualRPS.toFixed(2)}`, 
+        Math.abs(actualRPS - TARGET_RPS) < 50 ? 'success' : 'warn');
+    log(`   RPS Accuracy:          ${((actualRPS/TARGET_RPS)*100).toFixed(2)}%`, 
+        Math.abs(actualRPS - TARGET_RPS) < 50 ? 'success' : 'warn');
+    
+    // RPS Distribution
+    log('\n🎯 RPS DISTRIBUTION (per second):', 'info');
+    log('─'.repeat(80), 'info');
+    log(`   Min RPS:               ${rpsStats.min}`, 'info');
+    log(`   Max RPS:               ${rpsStats.max}`, 'info');
+    log(`   Avg RPS:               ${rpsStats.avg.toFixed(2)}`, 'info');
+    log(`   Std Dev:               ${rpsStats.stdDev.toFixed(2)}`, 'info');
+    log(`   Variance:              ${rpsVariance.toFixed(2)}`, 'info');
+    
+    // Latency Statistics
+    log('\n⚡ LATENCY STATISTICS:', 'info');
+    log('─'.repeat(80), 'info');
+    log(`   Min Latency:           ${latencyStats.min}ms`, 'info');
+    log(`   Max Latency:           ${latencyStats.max}ms`, 'info');
+    log(`   Avg Latency:           ${latencyStats.avg.toFixed(2)}ms`, 
+        latencyStats.avg < 100 ? 'success' : 'warn');
+    log(`   Median (p50):          ${latencyStats.p50}ms`, 'info');
+    log(`   p75:                   ${latencyStats.p75}ms`, 'info');
+    log(`   p90:                   ${latencyStats.p90}ms`, 'info');
+    log(`   p95:                   ${latencyStats.p95}ms`, 
+        latencyStats.p95 < 200 ? 'success' : 'warn');
+    log(`   p99:                   ${latencyStats.p99}ms`, 
+        latencyStats.p99 < 500 ? 'success' : 'warn');
+    log(`   p99.9:                 ${latencyStats.p999}ms`, 'info');
+    
+    // Error Distribution
+    if (Object.keys(globalMetrics.errors).length > 0) {
+        log('\n❌ ERROR DISTRIBUTION:', 'error');
+        log('─'.repeat(80), 'error');
+        Object.entries(globalMetrics.errors)
+            .sort((a, b) => b[1] - a[1])
+            .forEach(([error, count]) => {
+                log(`   ${error}: ${count} (${((count/globalMetrics.totalRequests)*100).toFixed(2)}%)`, 'error');
+            });
+    }
+    
+    // Per-Second Breakdown (show first 5, last 5, and any anomalies)
+    log('\n📈 PER-SECOND BREAKDOWN (Sample):', 'info');
+    log('─'.repeat(80), 'info');
+    log('   Sec |  RPS  | Success | Failed | Avg Latency | Status', 'info');
+    log('   ' + '─'.repeat(74), 'info');
+    
+    // Show first 5 seconds
+    perSecondMetrics.slice(0, 5).forEach(m => {
+        const avgLat = m.latencies.length > 0 ? 
+            (m.latencies.reduce((a, b) => a + b, 0) / m.latencies.length).toFixed(1) : '0';
+        const status = m.rps >= TARGET_RPS * 0.9 && m.rps <= TARGET_RPS * 1.1 ? '✅' : '⚠️';
+        log(`   ${String(m.second).padStart(3)} | ${String(m.rps).padStart(5)} | ${String(m.success).padStart(7)} | ` +
+            `${String(m.failed).padStart(6)} | ${String(avgLat).padStart(11)}ms | ${status}`, 'info');
+    });
+    
+    if (perSecondMetrics.length > 10) {
+        log('   ...', 'info');
+        
+        // Show last 5 seconds
+        perSecondMetrics.slice(-5).forEach(m => {
+            const avgLat = m.latencies.length > 0 ? 
+                (m.latencies.reduce((a, b) => a + b, 0) / m.latencies.length).toFixed(1) : '0';
+            const status = m.rps >= TARGET_RPS * 0.9 && m.rps <= TARGET_RPS * 1.1 ? '✅' : '⚠️';
+            log(`   ${String(m.second).padStart(3)} | ${String(m.rps).padStart(5)} | ${String(m.success).padStart(7)} | ` +
+                `${String(m.failed).padStart(6)} | ${String(avgLat).padStart(11)}ms | ${status}`, 'info');
+        });
+    }
+    
+    // Performance Evaluation
+    log('\n🎯 PERFORMANCE EVALUATION:', 'info');
+    log('─'.repeat(80), 'info');
+    
+    const performanceChecks = [
+        { 
+            name: 'RPS Target Achieved', 
+            passed: Math.abs(actualRPS - TARGET_RPS) < 100,
+            value: `${actualRPS.toFixed(0)}/${TARGET_RPS}`,
+            target: '±100 RPS tolerance'
+        },
+        { 
+            name: 'Success Rate', 
+            passed: successRate >= 95,
+            value: `${successRate.toFixed(2)}%`,
+            target: '≥95%'
+        },
+        { 
+            name: 'Avg Latency', 
+            passed: latencyStats.avg < 100,
+            value: `${latencyStats.avg.toFixed(2)}ms`,
+            target: '<100ms'
+        },
+        { 
+            name: 'p95 Latency', 
+            passed: latencyStats.p95 < 200,
+            value: `${latencyStats.p95}ms`,
+            target: '<200ms'
+        },
+        { 
+            name: 'p99 Latency', 
+            passed: latencyStats.p99 < 500,
+            value: `${latencyStats.p99}ms`,
+            target: '<500ms'
+        },
+        { 
+            name: 'RPS Consistency', 
+            passed: rpsStats.stdDev < 100,
+            value: `σ=${rpsStats.stdDev.toFixed(2)}`,
+            target: 'σ<100'
+        }
+    ];
+    
+    performanceChecks.forEach(check => {
+        const status = check.passed ? '✅' : '❌';
+        const color = check.passed ? 'success' : 'error';
+        log(`   ${status} ${check.name.padEnd(22)}: ${check.value.padEnd(15)} (target: ${check.target})`, color);
+    });
+    
+    const allChecksPassed = performanceChecks.every(c => c.passed);
+    
+    // Final verdict
+    log('\n' + '='.repeat(80), 'info');
+    if (allChecksPassed) {
+        log('✅ PRECISE 2000 RPS TEST PASSED - All targets met! 🎉', 'success');
+    } else {
+        const failedChecks = performanceChecks.filter(c => !c.passed).length;
+        log(`⚠️  PRECISE 2000 RPS TEST COMPLETED - ${failedChecks} target(s) not met`, 'warn');
+    }
+    log('='.repeat(80) + '\n', 'info');
+    
+    return {
+        passed: allChecksPassed,
+        name: 'Precise 2000 RPS Load Test',
+        metrics: {
+            global: globalMetrics,
+            latency: latencyStats,
+            rps: rpsStats,
+            perSecond: perSecondMetrics,
+            performance: performanceChecks
+        }
+    };
+}
+
 // ============================================================================
 // MAIN TEST RUNNER
 // ============================================================================
@@ -697,6 +1038,7 @@ async function runFunctionalTests() {
 async function main() {
     const args = process.argv.slice(2);
     const mode = args[0] || 'all';
+    const duration = parseInt(args[1]) || 60; // Optional duration parameter
     
     log('\n' + '█'.repeat(60), 'info');
     log('  MATCHING ENGINE COMPREHENSIVE TEST SUITE  ', 'info');
@@ -704,6 +1046,7 @@ async function main() {
     
     let functionalPassed = true;
     let loadPassed = true;
+    let preciseLoadPassed = true;
     
     try {
         if (mode === 'functional' || mode === 'all') {
@@ -715,18 +1058,40 @@ async function main() {
             loadPassed = (await runLoadTest()).passed;
         }
         
+        if (mode === 'precise' || mode === 'precise2000') {
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Pause before test
+            preciseLoadPassed = (await runPrecise2000RpsLoadTest(duration)).passed;
+        }
+        
         // Final summary
         log('\n' + '█'.repeat(60), 'info');
         log('  FINAL RESULTS  ', 'info');
         log('█'.repeat(60) + '\n', 'info');
         
-        if (functionalPassed && loadPassed) {
-            log('✅ ALL TESTS PASSED! System is working correctly! 🎉\n', 'success');
+        const testsRun = [];
+        if (mode === 'functional' || mode === 'all') {
+            testsRun.push({ name: 'Functional Tests', passed: functionalPassed });
+        }
+        if (mode === 'load' || mode === 'all') {
+            testsRun.push({ name: 'Load Test', passed: loadPassed });
+        }
+        if (mode === 'precise' || mode === 'precise2000') {
+            testsRun.push({ name: 'Precise 2000 RPS Test', passed: preciseLoadPassed });
+        }
+        
+        testsRun.forEach(test => {
+            const status = test.passed ? '✅' : '❌';
+            const color = test.passed ? 'success' : 'error';
+            log(`${status} ${test.name}`, color);
+        });
+        
+        const allPassed = testsRun.every(t => t.passed);
+        
+        if (allPassed) {
+            log('\n✅ ALL TESTS PASSED! System is working correctly! 🎉\n', 'success');
             process.exit(0);
         } else {
-            if (!functionalPassed) log('❌ Functional tests failed', 'error');
-            if (!loadPassed) log('⚠️  Load test targets not met', 'warn');
-            log('', 'info');
+            log('\n⚠️  Some tests did not meet all targets\n', 'warn');
             process.exit(1);
         }
         
@@ -744,5 +1109,5 @@ if (require.main === module) {
     main();
 }
 
-module.exports = { runFunctionalTests, runLoadTest };
+module.exports = { runFunctionalTests, runLoadTest, runPrecise2000RpsLoadTest };
 

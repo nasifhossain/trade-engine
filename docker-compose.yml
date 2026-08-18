@@ -13,31 +13,29 @@ services:
     environment:
       - NODE_ENV=${NODE_ENV}
       - PORT=${PORT}
-      - MYSQL_HOST=${MYSQL_HOST}
-      - MYSQL_USER=${MYSQL_USER}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
-      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - DATABASE_URL=${DATABASE_URL}
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
     depends_on:
-      - mysql
+      - postgres
       - redis
-    command: ["npm", "run", "dev"]
+    command: [ "npm", "run", "dev" ]
     networks:
       - twocents-network
 
-  # MySQL Database
-  mysql:
-    image: mysql:8.0
-    container_name: twocents-mysql
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: twocents-postgres
     restart: always
     ports:
-      - "${HOST_MYSQL_PORT}:3306"
+      - "${HOST_POSTGRES_PORT}:5432"
     environment:
-      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
-      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
     volumes:
-      - mysql-data:/var/lib/mysql
+      - postgres-data:/var/lib/postgresql/data
     networks:
       - twocents-network
 
@@ -53,34 +51,34 @@ services:
     networks:
       - twocents-network
 
-  # phpMyAdmin for MySQL Visualization
-  phpmyadmin:
-    image: phpmyadmin:latest
-    container_name: twocents-phpmyadmin
-    restart: always
-    ports:
-      - "${HOST_PHPMYADMIN_PORT:-8081}:80"
-    environment:
-      - PMA_HOST=${MYSQL_HOST}
-      - PMA_PORT=3306
-      - PMA_USER=${MYSQL_USER}
-      - PMA_PASSWORD=${MYSQL_PASSWORD}
-    depends_on:
-      - mysql
-    networks:
-      - twocents-network
-
-  # Redis Commander for Redis Visualization
+  # Redis Commander - Redis Visualization
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: twocents-redis-commander
     restart: always
     ports:
-      - "${HOST_REDIS_COMMANDER_PORT:-8082}:8081"
+      - "8081:8081"
     environment:
-      - REDIS_HOSTS=local:${REDIS_HOST}:${REDIS_PORT}
+      - REDIS_HOSTS=local:redis:6379
     depends_on:
       - redis
+    networks:
+      - twocents-network
+
+  # Prisma Studio - PostgreSQL Visualization
+  prisma-studio:
+    build: .
+    container_name: twocents-prisma-studio
+    restart: always
+    command: npx prisma studio --port 5555
+    ports:
+      - "5555:5555"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - HOST=0.0.0.0
+      - BROWSER=none
+    depends_on:
+      - postgres
     networks:
       - twocents-network
 
@@ -99,10 +97,9 @@ services:
       - twocents-network
 
 volumes:
-  mysql-data:
+  postgres-data:
   redis-data:
 
 networks:
   twocents-network:
     driver: bridge
-

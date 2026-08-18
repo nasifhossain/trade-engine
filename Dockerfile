@@ -1,4 +1,4 @@
-FROM node:18
+FROM node:22
 
 WORKDIR /app
 
@@ -8,6 +8,8 @@ RUN npm install
 
 # Copy application source
 COPY . .
+
+RUN npx prisma generate
 
 ENV PORT=3000
 ENV NODE_ENV=development
