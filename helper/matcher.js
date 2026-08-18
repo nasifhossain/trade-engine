@@ -29,28 +29,28 @@ class MatchingEngine {
      */
     async initialize(snapshotService = null) {
         try {
-            console.log('🔄 Initializing matching engine with Redis...');
+            // console.log('🔄 Initializing matching engine with Redis...');
 
             // Try snapshot-based recovery if available
             if (snapshotService && snapshotService.config.enabled) {
-                console.log('📸 Using snapshot-based recovery...');
+                // console.log('📸 Using snapshot-based recovery...');
                 const recoveryStats = await snapshotService.recoverAll();
 
-                console.log('✅ Matching engine initialized successfully via snapshots');
+                // console.log('✅ Matching engine initialized successfully via snapshots');
 
                 // Get book statistics from Redis
                 const stats = await this._getOrderBookStats();
-                console.log(`📊 Order book: ${stats.bidLevels} bid levels, ${stats.askLevels} ask levels`);
+                // console.log(`📊 Order book: ${stats.bidLevels} bid levels, ${stats.askLevels} ask levels`);
 
                 if (stats.bestBid || stats.bestAsk) {
-                    console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
+                    // console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
                 }
 
                 return recoveryStats;
             }
 
             // Fallback: Full replay from MySQL
-            console.log('📋 Using full replay recovery (no snapshots)...');
+            // console.log('📋 Using full replay recovery (no snapshots)...');
 
             // OPTIMIZATION: Single query with IN clause instead of two separate queries
             const openOrders = await this.prisma.order.findMany({
@@ -58,7 +58,7 @@ class MatchingEngine {
                 orderBy: { created_at: 'asc' }
             });
 
-            console.log(`📋 Loading ${openOrders.length} open orders into Redis order book`);
+            // console.log(`📋 Loading ${openOrders.length} open orders into Redis order book`);
 
             // OPTIMIZATION: Batch load orders into Redis using pipeline
             let bidsLoaded = 0;
@@ -107,17 +107,17 @@ class MatchingEngine {
 
                 // Execute all Redis operations in a single batch
                 await pipeline.exec();
-                console.log(`✅ Batch loaded ${openOrders.length} orders to Redis using pipeline`);
+                // console.log(`✅ Batch loaded ${openOrders.length} orders to Redis using pipeline`);
             }
 
-            console.log('✅ Matching engine initialized successfully via full replay');
+            // console.log('✅ Matching engine initialized successfully via full replay');
 
             // Get book statistics from Redis for default instrument
             const stats = await this._getOrderBookStats('BTC-USD');
-            console.log(`📊 Order book (BTC-USD): ${stats.bidLevels} bid levels (${bidsLoaded} orders), ${stats.askLevels} ask levels (${asksLoaded} orders)`);
+            // console.log(`📊 Order book (BTC-USD): ${stats.bidLevels} bid levels (${bidsLoaded} orders), ${stats.askLevels} ask levels (${asksLoaded} orders)`);
 
             if (stats.bestBid || stats.bestAsk) {
-                console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
+                // console.log(`💰 Best prices - Bid: ${stats.bestBid || 'N/A'}, Ask: ${stats.bestAsk || 'N/A'}`);
             }
 
             return { method: 'full_replay', totalOrders: openOrders.length };
@@ -154,7 +154,7 @@ class MatchingEngine {
             if (locked) {
                 // Fast path: got lock immediately
                 if (retries > 0) {
-                    console.log(`🔒 Lock acquired for ${instrument} after ${retries} retries`);
+                    // console.log(`🔒 Lock acquired for ${instrument} after ${retries} retries`);
                 }
                 return { lockKey, lockValue };
             }
@@ -214,64 +214,66 @@ class MatchingEngine {
         }
     }
 
-    /**
-     * Process an incoming order and perform matching
-     * Uses hybrid locking: in-memory for single instance, Redis for distributed
-     * @param {Object} order - The incoming order
-     * @returns {Object} Match results with trades and updated order
-     */
     async processOrder(order) {
-        // OPTIMIZATION: Try in-memory lock first (zero latency for single instance)
-        const memoryLockAcquired = this._tryAcquireMemoryLock(order.instrument);
-
-        if (memoryLockAcquired) {
-            // Fast path: got in-memory lock, no Redis overhead
-            try {
-                return await this._executeOrderProcessing(order);
-            } finally {
-                this._releaseMemoryLock(order.instrument);
+        return new Promise((resolve, reject) => {
+            const instrument = order.instrument;
+            if (!this.processingQueues.has(instrument)) {
+                this.processingQueues.set(instrument, []);
             }
-        }
+            
+            // Queue the order for processing
+            this.processingQueues.get(instrument).push({ order, resolve, reject });
+            
+            // Trigger queue processing (non-blocking)
+            this._processQueue(instrument).catch(err => console.error('Queue processing error:', err));
+        });
+    }
 
-        // Fallback: Use Redis distributed lock (for multi-instance or high contention)
-        const lock = await this._acquireLock(order.instrument);
-        const lockKey = lock.lockKey;
-        const lockValue = lock.lockValue;
+    /**
+     * Process the memory queue serially per instrument
+     * This replaces the broken hybrid lock with a true serial queue
+     */
+    async _processQueue(instrument) {
+        // If already processing this instrument, let the running loop handle it
+        if (this.queueLocks.get(instrument)) return;
+        
+        this.queueLocks.set(instrument, true);
+        const queue = this.processingQueues.get(instrument);
 
         try {
-            return await this._executeOrderProcessing(order);
+            // Only acquire Redis lock ONCE per batch if we need distributed locking
+            // For a single instance, the memory queue is sufficient. 
+            // We'll acquire it to respect the multi-instance design safely.
+            const lock = await this._acquireLock(instrument);
+            
+            try {
+                while (queue.length > 0) {
+                    const { order, resolve, reject } = queue.shift();
+                    try {
+                        const matchResult = await this._executeOrderProcessing(order);
+                        
+                        // Fire and forget DB persistence to unblock the matching engine!
+                        this._persistMatchResult(matchResult, order).catch(err => {
+                            console.error('❌ Background persistence error:', err);
+                        });
+                        
+                        resolve(matchResult);
+                    } catch (error) {
+                        reject(error);
+                    }
+                }
+            } finally {
+                await this._releaseLock(lock.lockKey, lock.lockValue);
+            }
         } finally {
-            await this._releaseLock(lockKey, lockValue);
-            this._releaseMemoryLock(order.instrument); // Clean up memory lock too
-        }
-    }
-
-    /**
-     * Try to acquire in-memory lock (non-blocking, instant)
-     * @param {String} instrument - Trading instrument
-     * @returns {Boolean} True if lock acquired
-     */
-    _tryAcquireMemoryLock(instrument) {
-        if (!this.queueLocks.has(instrument)) {
             this.queueLocks.set(instrument, false);
         }
-
-        const isLocked = this.queueLocks.get(instrument);
-        if (!isLocked) {
-            this.queueLocks.set(instrument, true);
-            return true;
-        }
-        return false;
     }
 
-    /**
-     * Release in-memory lock
-     * @param {String} instrument - Trading instrument
-     */
-    _releaseMemoryLock(instrument) {
-        this.queueLocks.set(instrument, false);
-    }
+    // _tryAcquireMemoryLock removed in favor of serial queue
 
+    // _releaseMemoryLock removed in favor of serial queue 
+    
     /**
      * Execute the actual order processing logic (separated for reuse)
      * @param {Object} order - The incoming order
@@ -293,12 +295,12 @@ class MatchingEngine {
             await this._processLimitOrder(order, matchResult);
         }
 
-        // Persist all changes to database and update Redis
-        await this._persistMatchResult(matchResult, order);
+        // DB Persistence is now handled asynchronously by _processQueue
+        // await this._persistMatchResult(matchResult, order);
 
         // Log processing summary (only for trades to reduce noise)
         if (matchResult.trades.length > 0) {
-            console.log(`💫 Order ${order.order_id}: ${matchResult.trades.length} trades, status: ${order.status}`);
+            // console.log(`💫 Order ${order.order_id}: ${matchResult.trades.length} trades, status: ${order.status}`);
         }
 
         return matchResult;
@@ -338,9 +340,9 @@ class MatchingEngine {
                 const trade = this._createTrade(order, makerOrder, oppositeOrderRef.price, matchQuantity);
                 matchResult.trades.push(trade);
 
-                console.log(`🔄 Market order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
-                console.log(`   → Taker: ${order.order_id} (${order.client_id})`);
-                console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id})`);
+                // console.log(`🔄 Market order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
+                // console.log(`   → Taker: ${order.order_id} (${order.client_id})`);
+                // console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id})`);
 
                 // Update quantities
                 order.filled_quantity = parseFloat(order.filled_quantity) + matchQuantity;
@@ -362,7 +364,7 @@ class MatchingEngine {
                         makerOrder.order_id,
                         parseInt(makerOrder.created_at)
                     );
-                    console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
+                    // console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
                 }
             }
         }
@@ -406,9 +408,9 @@ class MatchingEngine {
                 const trade = this._createTrade(order, makerOrder, oppositeOrderRef.price, matchQuantity);
                 matchResult.trades.push(trade);
 
-                console.log(`🔄 Limit order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
-                console.log(`   → Taker: ${order.order_id} (${order.client_id}) - limit ${order.price}`);
-                console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id}) - got ${oppositeOrderRef.price}`);
+                // console.log(`🔄 Limit order match: ${matchQuantity} ${order.instrument} @ ${oppositeOrderRef.price} (${order.side} vs ${makerOrder.side})`);
+                // console.log(`   → Taker: ${order.order_id} (${order.client_id}) - limit ${order.price}`);
+                // console.log(`   → Maker: ${makerOrder.order_id} (${makerOrder.client_id}) - got ${oppositeOrderRef.price}`);
 
                 // Update quantities
                 order.filled_quantity = parseFloat(order.filled_quantity) + matchQuantity;
@@ -430,7 +432,7 @@ class MatchingEngine {
                         makerOrder.order_id,
                         parseInt(makerOrder.created_at)
                     );
-                    console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
+                    // console.log(`   → Maker order ${makerOrder.order_id} fully filled and removed from book`);
                 }
             }
         }
@@ -532,19 +534,19 @@ class MatchingEngine {
                     executed_at: trade.executed_at
                 };
 
-                console.log(`Inserting trade: ${trade.trade_id} - ${trade.quantity} ${trade.instrument} @ ${trade.price}`);
+                // console.log(`Inserting trade: ${trade.trade_id} - ${trade.quantity} ${trade.instrument} @ ${trade.price}`);
 
                 await this.prisma.trade.create({ data: tradeData });
 
                 // Add to recent trades in Redis for fast access
                 await this.redisService.addRecentTrade(trade.instrument, trade);
 
-                console.log(`✓ Trade ${trade.trade_id} persisted`);
+                // console.log(`✓ Trade ${trade.trade_id} persisted`);
             }
 
             // Update orders in database and Redis cache
             for (const updatedOrder of matchResult.orderUpdates) {
-                console.log(`Updating order: ${updatedOrder.order_id} - filled: ${updatedOrder.filled_quantity}/${updatedOrder.quantity}, status: ${updatedOrder.status}`);
+                // console.log(`Updating order: ${updatedOrder.order_id} - filled: ${updatedOrder.filled_quantity}/${updatedOrder.quantity}, status: ${updatedOrder.status}`);
 
                 const updateResult = await this.prisma.order.update({
                     where: { order_id: updatedOrder.order_id },
@@ -562,7 +564,7 @@ class MatchingEngine {
                     updatedOrder.filled_quantity
                 );
 
-                console.log(`✓ Order ${updatedOrder.order_id} persisted`);
+                // console.log(`✓ Order ${updatedOrder.order_id} persisted`);
             }
 
             // Update metrics in Redis
@@ -571,7 +573,7 @@ class MatchingEngine {
                 await this.redisService.incrementMetric('trades:total', matchResult.trades.length);
             }
 
-            console.log(`✓ Match result persisted: ${matchResult.trades.length} trades, ${matchResult.orderUpdates.length} order updates`);
+            // console.log(`✓ Match result persisted: ${matchResult.trades.length} trades, ${matchResult.orderUpdates.length} order updates`);
 
         } catch (error) {
             console.error('❌ Error persisting match result:', error);
