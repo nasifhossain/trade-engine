@@ -558,26 +558,34 @@ async function runLoadTest() {
         process.stdout.write(`\r[${bar}] ${progress.toFixed(1)}% | Requests: ${requestCount} | Success: ${results.success} | Failed: ${results.failed}`);
     }, 500);
     
+    const startHighRes = process.hrtime.bigint();
+    
     while (Date.now() < endTime) {
-        const requestStartTime = Date.now();
+        // Calculate how many requests SHOULD have been sent by now
+        const elapsedMs = Number(process.hrtime.bigint() - startHighRes) / 1000000;
+        const expectedRequests = Math.floor(elapsedMs * (targetRPS / 1000));
         
-        promises.push(
-            createLoadTestOrder().then(result => {
-                if (result.success) {
-                    results.success++;
-                } else {
-                    results.failed++;
-                }
-                results.latencies.push(result.latency);
-            })
-        );
+        // If we are behind schedule, send requests to catch up
+        if (requestCount < expectedRequests) {
+            const batchSize = expectedRequests - requestCount;
+            
+            for (let i = 0; i < batchSize; i++) {
+                promises.push(
+                    createLoadTestOrder().then(result => {
+                        if (result.success) {
+                            results.success++;
+                        } else {
+                            results.failed++;
+                        }
+                        results.latencies.push(result.latency);
+                    })
+                );
+                requestCount++;
+            }
+        }
         
-        requestCount++;
-        
-        // Maintain target RPS
-        const elapsed = Date.now() - requestStartTime;
-        const sleep = Math.max(0, interval - elapsed);
-        await new Promise(resolve => setTimeout(resolve, sleep));
+        // Yield event loop for a tiny amount to allow responses to be processed
+        await new Promise(resolve => setTimeout(resolve, 1));
     }
     
     // Wait for all requests to complete
